@@ -2,8 +2,9 @@ import os
 import h5py
 import torch
 import numpy as np
+from typing import Optional
 from torch.utils.data import Dataset
-from src.data.augment import normalize_point_cloud, rotate_point_cloud_y, random_scale_point_cloud, random_jitter_point_cloud
+from data.augment import normalize_point_cloud, rotate_point_cloud_y, random_scale_point_cloud, random_jitter_point_cloud
 
 
 class ScanObjectNN(Dataset):
@@ -27,9 +28,18 @@ class ScanObjectNN(Dataset):
         num_classes (int): Number of unique classes.
     """
     
-    def __init__(self, root_dir, split='training', variant='main_split', 
-                 augmentation='base', background=True, num_points=1024, 
-                 normalize=True, use_newsplit=False, use_custom_augmentation=False):
+    def __init__(
+        self,
+        root_dir: str, 
+        split: str = 'training',
+        variant: str = 'main_split', 
+        augmentation: str = 'base', 
+        background:str = True, 
+        num_points: Optional[int] = None, 
+        normalize: bool = False, 
+        use_newsplit: bool = False, 
+        use_custom_augmentation: bool = False
+    ) -> None:
         """Initialize ScanObjectNN dataset.
         
         Args:
@@ -39,7 +49,8 @@ class ScanObjectNN(Dataset):
             augmentation (str): Augmentation variant, one of ['base', 'augmented25_norot', 
                                 'augmented25rot', 'augmentedrot', 'augmentedrot_scale75'].
             background (bool): If False, uses the _nobg variant without background.
-            num_points (int): Number of points to sample for each point cloud.
+            num_points (int or None): Number of points to sample for each point cloud.
+                                     If None, returns all points without sampling.
             normalize (bool): Whether to normalize point clouds.
             use_newsplit (bool): If True and using augmentedrot_scale75, uses the newsplit variant.
             use_custom_augmentation (bool): Whether to use custom augmentation techniques.
@@ -112,6 +123,7 @@ class ScanObjectNN(Dataset):
         
         Samples or pads the point cloud to the specified number of points,
         normalizes if required, and applies augmentations during training.
+        If num_points is None, returns all points without sampling.
         
         Args:
             idx (int): Index of the point cloud to retrieve.
@@ -120,17 +132,23 @@ class ScanObjectNN(Dataset):
             tuple: (point_cloud, label) where point_cloud is a tensor of shape (num_points, 3)
                   and label is a tensor containing the class label.
         """
-        points = self.data[idx][:self.num_points]
+        if self.num_points is None:
+            # Return all points when num_points is None
+            points = self.data[idx]
+        else:
+            # Sample or pad to the specified number of points
+            points = self.data[idx][:self.num_points]
+            
+            # Handle variable point numbers
+            if points.shape[0] < self.num_points:
+                indices = np.random.choice(points.shape[0], self.num_points, replace=True)
+                points = points[indices]
+            elif points.shape[0] > self.num_points:
+                indices = np.random.choice(points.shape[0], self.num_points, replace=False)
+                points = points[indices]
+                
         label = self.labels[idx]
         
-        # Handle variable point numbers
-        if points.shape[0] < self.num_points:
-            indices = np.random.choice(points.shape[0], self.num_points, replace=True)
-            points = points[indices]
-        elif points.shape[0] > self.num_points:
-            indices = np.random.choice(points.shape[0], self.num_points, replace=False)
-            points = points[indices]
-            
         # Normalize
         if self.normalize:
             points = normalize_point_cloud(points)

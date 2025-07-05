@@ -210,7 +210,7 @@ def compare_augmentations(root_dir, sample_idx=0):
 
 def main():
     # Configure paths
-    root_dir = "/home/basti/Development/University/3DVision/adapting-2D-ViTs-for-3D-point-cloud-understanding/.data/h5_files"  # Update this path!
+    root_dir = "/home/basti/Development/University/3DVision/adapting-2D-ViTs-for-3D-point-cloud-understanding/.data/h5_files"
     
     # Run tests
     print("="*60)

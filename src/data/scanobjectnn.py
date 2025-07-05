@@ -2,10 +2,15 @@ import os
 import h5py
 import torch
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 from torch.utils.data import Dataset
-from data.augment import normalize_point_cloud, rotate_point_cloud_y, random_scale_point_cloud, random_jitter_point_cloud
-
+from data.augment import (
+    normalize_point_cloud,
+    rotate_point_cloud_y,
+    rotate_point_cloud_z,
+    random_scale_point_cloud, 
+    random_jitter_point_cloud
+)
 
 class ScanObjectNN(Dataset):
     """ScanObjectNN dataset for point cloud classification.
@@ -38,7 +43,8 @@ class ScanObjectNN(Dataset):
         num_points: Optional[int] = None, 
         normalize: bool = False, 
         use_newsplit: bool = False, 
-        use_custom_augmentation: bool = False
+        use_custom_augmentation: bool = False,
+        sampling_method: str = 'all',
     ) -> None:
         """Initialize ScanObjectNN dataset.
         
@@ -54,6 +60,8 @@ class ScanObjectNN(Dataset):
             normalize (bool): Whether to normalize point clouds.
             use_newsplit (bool): If True and using augmentedrot_scale75, uses the newsplit variant.
             use_custom_augmentation (bool): Whether to use custom augmentation techniques.
+            sampling_method (str): Method for sampling points ('all', 'first', 'random'). 
+                                 If 'random', randomly samples points.
         """
         self.root_dir = root_dir
         self.split = split
@@ -64,6 +72,7 @@ class ScanObjectNN(Dataset):
         self.normalize = normalize
         self.use_newsplit = use_newsplit
         self.use_custom_augmentation = use_custom_augmentation
+        self.sampling_method = sampling_method
         
         # Load data
         self.data, self.labels = self._load_data()
@@ -123,33 +132,40 @@ class ScanObjectNN(Dataset):
         
         Samples or pads the point cloud to the specified number of points,
         normalizes if required, and applies augmentations during training.
-        If num_points is None, returns all points without sampling.
         
         Args:
             idx (int): Index of the point cloud to retrieve.
             
         Returns:
             tuple: (point_cloud, label) where point_cloud is a tensor of shape (num_points, 3)
+                  or (fps_samples, knn, 3) if using FPS sampling
                   and label is a tensor containing the class label.
         """
-        if self.num_points is None:
-            # Return all points when num_points is None
-            points = self.data[idx]
-        else:
+        points = self.data[idx]
+        label = self.labels[idx]
+        
+        # Apply different sampling methods
+        if self.sampling_method == 'all' or self.num_points is None:
+            # Return all points
+            pass
+        elif self.sampling_method == 'first':
             # Sample or pad to the specified number of points
-            points = self.data[idx][:self.num_points]
-            
-            # Handle variable point numbers
             if points.shape[0] < self.num_points:
                 indices = np.random.choice(points.shape[0], self.num_points, replace=True)
                 points = points[indices]
             elif points.shape[0] > self.num_points:
+                points = points[:self.num_points]
+        elif self.sampling_method == 'random':
+            # Randomly sample points
+            if points.shape[0] < self.num_points:
+                # If too few points, sample with replacement
+                indices = np.random.choice(points.shape[0], self.num_points, replace=True)
+            else:
+                # If enough points, sample without replacement
                 indices = np.random.choice(points.shape[0], self.num_points, replace=False)
-                points = points[indices]
-                
-        label = self.labels[idx]
+            points = points[indices]
         
-        # Normalize
+        # Normalize if needed
         if self.normalize:
             points = normalize_point_cloud(points)
                 
@@ -157,25 +173,15 @@ class ScanObjectNN(Dataset):
         if self.split == 'training':
             if self.use_custom_augmentation:
                 # Apply custom augmentation techniques
-                # Random rotation around y-axis with higher probability
-                if np.random.random() > 0.2:  # 80% chance to apply rotation
+                if np.random.random() > 0.2:
                     points = rotate_point_cloud_y(points)
-                
-                # More aggressive scaling
-                points = random_scale_point_cloud(points, scale_low=0.8, scale_high=1.2)
-                
-                # More aggressive jittering
-                points = random_jitter_point_cloud(points, sigma=0.02, clip=0.04)
-            else:
-                # Only apply runtime augmentations if not using pre-augmented data with rotations
-                if 'rot' not in self.augmentation:
-                    # Random rotation around y-axis
-                    points = rotate_point_cloud_y(points)
-                
+                if np.random.random() > 0.2:
+                    points = rotate_point_cloud_z(points)
+
                 # Random scaling
-                points = random_scale_point_cloud(points, scale_low=0.95, scale_high=1.05)
+                points = random_scale_point_cloud(points, scale_low=0.9, scale_high=1.1)
                 
-                # Random jitter
-                points = random_jitter_point_cloud(points, sigma=0.01, clip=0.02)
+                # Random jittering
+                points = random_jitter_point_cloud(points, sigma=0.02, clip=0.04)
             
         return torch.FloatTensor(points), torch.LongTensor([label]).squeeze()

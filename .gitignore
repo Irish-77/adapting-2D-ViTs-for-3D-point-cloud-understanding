@@ -32,3 +32,4 @@ venv.bak/
 .data/
 .notes/
 .deprecated/
+output/

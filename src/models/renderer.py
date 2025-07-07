@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from models import get_vit
 from typing import Tuple, Iterator
 from models.apf import AdaptedViTBlock
+from models.diff_renderer import DifferentiablePointCloudRenderer, ViewTransformationNetwork
 
 class PointCloudRenderer(nn.Module):
     """Renders point clouds as multi-view images.
@@ -182,6 +183,8 @@ class PointCloudRendererClassifier(nn.Module):
     
     This model renders a point cloud from multiple viewpoints and processes the resulting
     images through a Vision Transformer with adapter layers for classification.
+
+    Option to use a differentiable renderer for training based on the MVTN paper.
     """
     
     def __init__(
@@ -191,6 +194,8 @@ class PointCloudRendererClassifier(nn.Module):
         adapter_dim: int = 64,
         num_views: int = 6,
         img_size: int = 224,
+        diff_renderer: bool = False,
+        view_transform_hidden: int = 256,
         pretrained: bool = True,
         dropout_rate: float = 0.1
     ) -> None:
@@ -202,17 +207,30 @@ class PointCloudRendererClassifier(nn.Module):
             adapter_dim: Dimension of the bottleneck in adapter layers.
             num_views: Number of viewpoints to render the point cloud from.
             img_size: Size of the rendered images (img_size × img_size).
+            diff_renderer: Whether to use a differentiable renderer.
+            view_transform_hidden: Hidden dimension for the view transformation network.
             pretrained: Whether to use pretrained weights for the ViT.
             dropout_rate: Dropout rate for regularization.
         """
         super().__init__()
         
-        # Point cloud renderer
-        self.renderer = PointCloudRenderer(img_size=img_size, num_views=num_views)
         self.num_views = num_views
+        self.diff_renderer = diff_renderer
+        if diff_renderer is False:
+            # Default Point cloud renderer
+            self.renderer = PointCloudRenderer(img_size=img_size, num_views=num_views)    
+        else:
+            # Use DiffRenderer for point cloud rendering
+            self.view_transform_net = ViewTransformationNetwork(
+                num_views=num_views,
+                hidden_dim=view_transform_hidden
+            )
+            self.renderer = DifferentiablePointCloudRenderer(img_size=img_size)
         
         # Load pre-trained ViT
         self.vit, self.embed_dim = get_vit(vit_name, pretrained)
+        # Replace ViT's head with an identity layer to get feature embeddings
+        self.vit.heads = nn.Identity()
         
         # Replace ViT blocks with adapted versions
         adapted_blocks = []
@@ -239,6 +257,41 @@ class PointCloudRendererClassifier(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(256, num_classes)
         )
+    
+    def _get_rendered_views(self, points: torch.Tensor) -> torch.Tensor:
+        """Render point cloud from multiple views.
+        
+        Args:
+            points: Point cloud tensor of shape (B, N, 3) where B is batch size,
+                   N is number of points, and 3 represents XYZ coordinates.
+        
+        Returns:
+            Rendered views tensor of shape (B, num_views, 3, img_size, img_size).
+        """
+        if self.diff_renderer is False:
+            return self.renderer(points)
+        else:
+            # Old approach with for loop (not vectorized)
+            # azimuths, elevations = self.view_transform_net(points)  # (B, num_views) each
+            # # Render point cloud from learned views
+            # rendered_views = []
+            # for v in range(self.num_views):
+            #     view_img = self.renderer(points, azimuths[:, v], elevations[:, v])
+            #     rendered_views.append(view_img)
+            # # Stack views
+            # rendered_views = torch.stack(rendered_views, dim=1)  # (B, num_views, 3, H, W)
+
+            # Vectorized rendering for all views
+            B, N, _ = points.shape
+            azimuths, elevations = self.view_transform_net(points)
+            points_expanded = points.unsqueeze(1).expand(-1, self.num_views, -1, -1).reshape(B * self.num_views, N, 3)
+            azimuths_flat = azimuths.reshape(B * self.num_views)
+            elevations_flat = elevations.reshape(B * self.num_views)
+            rendered_views_flat = self.renderer(points_expanded, azimuths_flat, elevations_flat)
+            _, C, H, W = rendered_views_flat.shape
+            rendered_views = rendered_views_flat.reshape(B, self.num_views, C, H, W)
+
+            return rendered_views
         
     def forward(self, points: torch.Tensor) -> torch.Tensor:
         """Process point clouds through rendering and classification.
@@ -253,13 +306,12 @@ class PointCloudRendererClassifier(nn.Module):
         B = points.shape[0]
         
         # Render point cloud from multiple views
-        rendered_views = self.renderer(points)  # (B, num_views, 3, H, W)
+        rendered_views = self._get_rendered_views(points) 
         
         # Process each view through ViT
         view_features = []
         for v in range(self.num_views):
             view_img = rendered_views[:, v]  # (B, 3, H, W)
-            
             # Forward through ViT
             features = self.vit(view_img)  # (B, embed_dim)
             view_features.append(features)
@@ -295,3 +347,22 @@ class PointCloudRendererClassifier(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         return trainable, total
+
+    def get_predicted_views(self, points: torch.Tensor) -> torch.Tensor:
+        """Get the predicted view angles for visualization
+        
+        Args:
+            points: Point cloud tensor of shape (B, N, 3).
+        
+        Returns:
+            Rendered views tensor of shape (B, num_views, 3, img_size, img_size).
+        """
+        if self.diff_renderer is False:
+            raise ValueError("This method is only available when using a differentiable renderer.")
+        
+        with torch.no_grad():
+            azimuths, elevations = self.view_transform_net(points)
+            # Convert to degrees
+            azimuths_deg = azimuths * 180 / torch.pi
+            elevations_deg = elevations * 180 / torch.pi
+        return azimuths_deg, elevations_deg

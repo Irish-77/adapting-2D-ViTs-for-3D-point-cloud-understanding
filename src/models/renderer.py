@@ -189,7 +189,7 @@ class PointCloudRendererClassifier(nn.Module):
     
     def __init__(
         self,
-        num_classes: int = 15,  # ScanObjectNN has 15 classes
+        num_classes: int = 15,
         vit_name: str = 'vit_b_16',
         adapter_dim: int = 64,
         num_views: int = 6,

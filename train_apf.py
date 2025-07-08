@@ -28,7 +28,6 @@ dataset_config = {
 
 train_config = {
     'batch_size': 16,
-    'num_workers': 4,
     'learning_rate': 5e-4,
     'weight_decay': 5e-2,
     'save_interval': 5,

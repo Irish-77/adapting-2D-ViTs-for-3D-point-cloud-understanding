@@ -8,8 +8,10 @@ import torch.optim as optim
 from tqdm import tqdm
 from typing import  Tuple
 from data import ScanObjectNN
+from datetime import datetime
 from torch.utils.data import DataLoader
 from models import AdaptPointFormer, AdaptPointFormerWithSampling
+from train.train_utils import save_configs
 
 
 class APFTrainer:
@@ -46,6 +48,9 @@ class APFTrainer:
         
         # Path for metrics CSV file
         self.metrics_csv_path = os.path.join(output_dir, "training_metrics.csv")
+        
+        # Save all configurations to a file
+        save_configs(model_config, dataset_config, train_config, output_dir, self.device)
         
         # Initialize the model, datasets, and loaders
         self._init_model()

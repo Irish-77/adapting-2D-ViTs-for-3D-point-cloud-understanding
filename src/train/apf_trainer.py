@@ -4,9 +4,10 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 
 from tqdm import tqdm
-from typing import  Tuple
+from typing import  Tuple, Optional
 from data import ScanObjectNN
 from datetime import datetime
 from torch.utils.data import DataLoader
@@ -152,10 +153,7 @@ class APFTrainer:
         )
         
     def _init_optimizer(self) -> None:
-        """Initialize optimizer and criterion.
-        
-        We used the same optimizer and loss function as in the original paper.
-        """
+        """Initialize optimizer, learning rate scheduler, and criterion."""
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
             self.model.get_trainable_params(),
@@ -163,12 +161,37 @@ class APFTrainer:
             weight_decay=self.train_config['weight_decay']
         )
         
-    def _init_metrics_csv(self) -> None:
-        """Initialize the CSV file for tracking metrics.
+        # Initialize learning rate scheduler if enabled
+        self.scheduler = None
+        if self.train_config.get('use_lr_scheduler', False):
+            total_epochs = self.train_config['epochs']
+            warmup_epochs = self.train_config.get('warmup_epochs', 0)
+            warmup_factor = self.train_config.get('warmup_factor', 0.1)
+            min_factor = self.train_config.get('min_factor', 1e-6)
+            
+            # Create warmup + cosine annealing scheduler
+            if warmup_epochs > 0:
+                # Define warmup function
+                def lr_lambda(epoch):
+                    if epoch < warmup_epochs:
+                        # Linear warmup
+                        return warmup_factor + (1.0 - warmup_factor) * epoch / warmup_epochs
+                    else:
+                        # Cosine annealing
+                        return min_factor + 0.5 * (1.0 + np.cos(np.pi * (epoch - warmup_epochs) / (total_epochs - warmup_epochs)))
+                
+                self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+            else:
+                # cosine annealing without warmup
+                self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_epochs, eta_min=min_factor)
         
-        Creates a new CSV file with headers for recording training metrics.
-        """
+    def _init_metrics_csv(self) -> None:
+        """Initialize the CSV file for tracking metrics."""
         headers = ['epoch', 'train_loss', 'train_accuracy', 'test_loss', 'test_accuracy']
+        
+        # Add learning rate to headers if scheduler is used
+        if self.train_config.get('use_lr_scheduler', False):
+            headers.append('learning_rate')
         
         with open(self.metrics_csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -176,28 +199,29 @@ class APFTrainer:
     
     def _update_metrics_csv(self, epoch: int, train_loss: float, 
                            train_acc: float, test_loss: float, test_acc: float) -> None:
-        """Append metrics for the current epoch to the CSV file.
+        """Append metrics for the current epoch to the CSV file."""
+        row = [epoch + 1, train_loss, train_acc, test_loss, test_acc]
         
-        Args:
-            epoch: Current training epoch.
-            train_loss: Average training loss for the epoch.
-            train_acc: Training accuracy for the epoch.
-            test_loss: Average test loss for the epoch.
-            test_acc: Test accuracy for the epoch.
-        """
+        # Add current learning rate to metrics if scheduler is used
+        if self.train_config.get('use_lr_scheduler', False):
+            current_lr = self.optimizer.param_groups[0]['lr']
+            row.append(current_lr)
+        
         with open(self.metrics_csv_path, 'a', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow([epoch + 1, train_loss, train_acc, test_loss, test_acc])
+            writer.writerow(row)
     
     def train(self) -> None:
-        """Main training loop.
-        
-        Executes the full training process including evaluation and model checkpointing.
-        """
+        """Main training loop."""
         best_acc = 0.0
         
         for epoch in range(self.train_config['epochs']):
             print(f"\nEpoch {epoch+1}/{self.train_config['epochs']}")
+            
+            # Print current learning rate
+            if self.scheduler:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f"Current learning rate: {current_lr:.6f}")
             
             # Training phase
             train_loss, train_acc = self._train_epoch()
@@ -208,11 +232,19 @@ class APFTrainer:
             # Update metrics CSV
             self._update_metrics_csv(epoch, train_loss, train_acc, test_loss, test_acc)
             
-            # Save model if it has the best accuracy so farpoint from epoch {checkpoint['epoch']} with accuracy {checkpoint['accuracy']:.4f}")
+            # Save model if it has better accuracy
+            if test_acc > best_acc:
+                best_acc = test_acc
+                self._save_checkpoint("model_best.pt", epoch, test_acc)
+                print(f"New best model saved with accuracy: {best_acc:.4f}")
                 
             # Save model periodically
             if (epoch + 1) % self.train_config['save_interval'] == 0:
                 self._save_checkpoint(f"model_epoch_{epoch+1}.pt", epoch, test_acc)
+            
+            # Step the learning rate scheduler
+            if self.scheduler:
+                self.scheduler.step()
                 
             # Print epoch results
             print(f"Epoch {epoch+1} results:")
@@ -223,13 +255,7 @@ class APFTrainer:
         print(f"Training metrics saved to {self.metrics_csv_path}")
             
     def _train_epoch(self) -> Tuple[float, float]:
-        """Train for one epoch.
-        
-        Returns:
-            tuple: A tuple containing:
-                - float: Average loss for the epoch
-                - float: Accuracy for the epoch
-        """
+        """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         correct = 0
@@ -247,8 +273,15 @@ class APFTrainer:
             logits = self.model(points)
             loss = self.criterion(logits, labels)
             
-            # Backward pass and optimize
+            # Backward pass
             loss.backward()
+            
+            # Apply gradient clipping if enabled
+            if self.train_config.get('use_grad_clip', False):
+                max_norm = self.train_config.get('grad_clip_norm', 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            
+            # Optimize
             self.optimizer.step()
             
             # Statistics

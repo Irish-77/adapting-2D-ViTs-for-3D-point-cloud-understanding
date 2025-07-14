@@ -9,7 +9,8 @@ from data.augment import (
     rotate_point_cloud_y,
     rotate_point_cloud_z,
     random_scale_point_cloud, 
-    random_jitter_point_cloud
+    random_jitter_point_cloud,
+    drop_and_replace_with_noise
 )
 
 class ScanObjectNN(Dataset):
@@ -44,6 +45,7 @@ class ScanObjectNN(Dataset):
         normalize: bool = False, 
         use_newsplit: bool = False, 
         use_custom_augmentation: bool = False,
+        augmentation_probability: float = 0.2,
         sampling_method: str = 'all',
     ) -> None:
         """Initialize ScanObjectNN dataset.
@@ -60,6 +62,7 @@ class ScanObjectNN(Dataset):
             normalize (bool): Whether to normalize point clouds.
             use_newsplit (bool): If True and using augmentedrot_scale75, uses the newsplit variant.
             use_custom_augmentation (bool): Whether to use custom augmentation techniques.
+            augmentation_probability (float): Probability of applying custom augmentations.
             sampling_method (str): Method for sampling points ('all', 'first', 'random'). 
                                  If 'random', randomly samples points.
         """
@@ -73,6 +76,7 @@ class ScanObjectNN(Dataset):
         self.use_newsplit = use_newsplit
         self.use_custom_augmentation = use_custom_augmentation
         self.sampling_method = sampling_method
+        self.augmentation_probability = augmentation_probability
         
         # Load data
         self.data, self.labels = self._load_data()
@@ -173,15 +177,15 @@ class ScanObjectNN(Dataset):
         if self.split == 'training':
             if self.use_custom_augmentation:
                 # Apply custom augmentation techniques
-                if np.random.random() > 0.2:
+                if np.random.random() > self.augmentation_probability:
                     points = rotate_point_cloud_y(points)
-                if np.random.random() > 0.2:
+                if np.random.random() > self.augmentation_probability:
                     points = rotate_point_cloud_z(points)
-
-                # Random scaling
-                points = random_scale_point_cloud(points, scale_low=0.9, scale_high=1.1)
-                
-                # Random jittering
-                points = random_jitter_point_cloud(points, sigma=0.02, clip=0.04)
+                if np.random.random() > self.augmentation_probability:
+                    points = random_scale_point_cloud(points, scale_low=0.8, scale_high=1.2)
+                if np.random.random() > self.augmentation_probability:
+                    points = random_jitter_point_cloud(points, sigma=0.03, clip=0.05)
+                if np.random.random() > self.augmentation_probability:
+                    points = drop_and_replace_with_noise(points, drop_ratio=0.2, noise_std=0.05)
             
         return torch.FloatTensor(points), torch.LongTensor([label]).squeeze()

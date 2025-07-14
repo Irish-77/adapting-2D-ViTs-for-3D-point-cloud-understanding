@@ -108,3 +108,48 @@ def rotate_point_cloud_z(points):
         [0, 0, 1]
     ])
     return points @ rotation_matrix
+
+def drop_and_replace_with_noise(point_cloud, drop_ratio=0.2, noise_std=0.02):
+    """Drop points from the point cloud and replace them with noisy points.
+    
+    This augmentation randomly selects points to drop,
+    then replaces them with noisy points placed randomly within the 
+    point cloud's bounding box, plus some Gaussian noise.
+    
+    Args:
+        point_cloud (np.ndarray): Input point cloud, shape (N, 3).
+        drop_ratio (float): Ratio of points to drop (between 0 and 1).
+        noise_std (float): Standard deviation for the Gaussian noise.
+        
+    Returns:
+        np.ndarray: Augmented point cloud with same shape as input.
+    """
+    num_points = point_cloud.shape[0]
+    drop_count = int(num_points * drop_ratio)
+    
+    # Randomly select indices to drop
+    drop_indices = np.random.choice(num_points, drop_count, replace=False)
+    keep_indices = np.setdiff1d(np.arange(num_points), drop_indices)
+    
+    # Keep the selected points
+    kept_points = point_cloud[keep_indices]
+    
+    # Create new noisy points within range of other points
+    min_bounds = np.min(point_cloud, axis=0)
+    max_bounds = np.max(point_cloud, axis=0)
+    
+    # Generate random points within the bounding box
+    random_points = np.random.uniform(
+        min_bounds, max_bounds, size=(drop_count, 3)
+    )
+    
+    # Add Gaussian noise
+    gaussian_noise = np.random.normal(0, noise_std, size=(drop_count, 3))
+    random_points += gaussian_noise
+    
+    # Combine kept points with new noisy points
+    augmented_point_cloud = np.zeros_like(point_cloud)
+    augmented_point_cloud[keep_indices] = kept_points
+    augmented_point_cloud[drop_indices] = random_points
+    
+    return augmented_point_cloud

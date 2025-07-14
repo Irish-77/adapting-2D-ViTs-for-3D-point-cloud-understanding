@@ -4,6 +4,9 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib.pyplot as plt
+from PIL import Image
+from matplotlib.figure import Figure
 
 from tqdm import tqdm
 from typing import Tuple
@@ -43,6 +46,10 @@ class RendererTrainer:
         
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Create directory for rendered views
+        self.views_dir = os.path.join(output_dir, "rendered_views")
+        os.makedirs(self.views_dir, exist_ok=True)
         
         # Path for metrics CSV file
         self.metrics_csv_path = os.path.join(output_dir, "training_metrics.csv")
@@ -181,6 +188,53 @@ class RendererTrainer:
             writer = csv.writer(csvfile)
             writer.writerow([epoch + 1, train_loss, train_acc, test_loss, test_acc])
     
+    def _save_rendered_views(self, points: torch.Tensor, epoch: int) -> None:
+        """Save rendered views of a point cloud as images.
+        
+        Args:
+            points: Point cloud tensor of shape (B, N, 3)
+            epoch: Current epoch number for filename
+        """
+        # Use only the first point cloud in the batch
+        point_cloud = points[0].unsqueeze(0)  # Shape (1, N, 3)
+        
+        # Get rendered views
+        self.model.eval()  # Set to eval mode
+        with torch.no_grad():
+            rendered_views = self.model._get_rendered_views(point_cloud)  # Shape (1, num_views, 3, H, W)
+        
+        # Convert tensor to numpy array and denormalize if needed
+        views = rendered_views[0].cpu().numpy()  # Shape (num_views, 3, H, W)
+        
+        # Create a grid of images
+        num_views = views.shape[0]
+        rows = int(np.ceil(num_views / 3))
+        cols = min(num_views, 3)
+        
+        fig = plt.figure(figsize=(cols * 4, rows * 4))
+        
+        for i in range(num_views):
+            # Get the view (C, H, W) and convert to (H, W, C)
+            img = np.transpose(views[i], (1, 2, 0))
+            
+            # Normalize to [0, 1] if needed
+            img = np.clip(img, 0, 1)
+            
+            # Add subplot
+            ax = fig.add_subplot(rows, cols, i + 1)
+            ax.imshow(img)
+            ax.axis('off')
+            ax.set_title(f'View {i}')
+        
+        plt.tight_layout()
+        
+        # Save figure
+        filename = os.path.join(self.views_dir, f"test_views_epoch_{epoch}.png")
+        plt.savefig(filename)
+        plt.close(fig)
+        
+        print(f"Test rendered views saved to {filename}")
+    
     def train(self) -> None:
         """Main training loop.
         
@@ -189,6 +243,9 @@ class RendererTrainer:
         best_acc = 0.0
         
         for epoch in range(self.train_config['epochs']):
+            # Store current epoch for view saving logic
+            self.current_epoch = epoch
+            
             print(f"\nEpoch {epoch+1}/{self.train_config['epochs']}")
             
             # Training phase
@@ -223,7 +280,8 @@ class RendererTrainer:
             
         print(f"\nTraining completed. Best test accuracy: {best_acc:.4f}")
         print(f"Training metrics saved to {self.metrics_csv_path}")
-            
+        print(f"Rendered views saved to {self.views_dir}")
+    
     def _train_epoch(self) -> Tuple[float, float]:
         """Train for one epoch.
         
@@ -293,9 +351,16 @@ class RendererTrainer:
         
         with torch.no_grad():
             pbar = tqdm(self.test_loader, desc="Testing")
-            for points, labels in pbar:
+            for batch_idx, (points, labels) in enumerate(pbar):
                 points = points.to(self.device)
                 labels = labels.to(self.device)
+                
+                # Save rendered views for the first batch of test data
+                if batch_idx == 0 and hasattr(self.model, '_get_rendered_views'):
+                    # Check if we should save views this epoch
+                    current_epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
+                    if current_epoch % self.train_config.get('save_views_interval', 5) == 0:
+                        self._save_rendered_views(points, current_epoch)
                 
                 # Forward pass
                 logits = self.model(points)

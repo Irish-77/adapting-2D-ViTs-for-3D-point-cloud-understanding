@@ -154,12 +154,11 @@ def drop_and_replace_with_noise(point_cloud, drop_ratio=0.05, noise_std=0.02):
     
     return augmented_point_cloud
 
-def random_rotate_point_cloud(points, ):
+def random_rotate_point_cloud(points):
     """Randomly rotate the point cloud around all axes.
     
     Args:
         points (numpy.ndarray): Point cloud of shape (N, 3)
-        rotation_range (tuple): Range of rotation angles in radians
         
     Returns:
         numpy.ndarray: Rotated point cloud

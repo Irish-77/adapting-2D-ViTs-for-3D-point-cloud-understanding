@@ -261,38 +261,55 @@ class APFTrainer:
         correct = 0
         total = 0
         
+        # Get gradient accumulation settings
+        use_grad_accumulation = self.train_config.get('use_grad_accumulation', False)
+        grad_accumulation_steps = self.train_config.get('grad_accumulation_steps', 1)
+        
         pbar = tqdm(self.train_loader, desc="Training")
-        for points, labels in pbar:
+        for i, (points, labels) in enumerate(pbar):
             points = points.to(self.device)
             labels = labels.to(self.device)
             
-            # Zero the gradients
-            self.optimizer.zero_grad()
+            # Zero the gradients only at the beginning of accumulation cycle
+            if not use_grad_accumulation or (i % grad_accumulation_steps == 0):
+                self.optimizer.zero_grad()
             
             # Forward pass
             logits = self.model(points)
             loss = self.criterion(logits, labels)
             
+            # Scale loss for gradient accumulation to maintain correct gradient magnitude
+            if use_grad_accumulation:
+                loss = loss / grad_accumulation_steps
+            
             # Backward pass
             loss.backward()
             
-            # Apply gradient clipping if enabled
-            if self.train_config.get('use_grad_clip', False):
-                max_norm = self.train_config.get('grad_clip_norm', 1.0)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            # Optimize only after accumulating enough gradients or at the end of the epoch
+            if not use_grad_accumulation or ((i + 1) % grad_accumulation_steps == 0) or (i == len(self.train_loader) - 1):
+                # Apply gradient clipping if enabled - moved here to clip after accumulation
+                if self.train_config.get('use_grad_clip', False):
+                    max_norm = self.train_config.get('grad_clip_norm', 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                
+                self.optimizer.step()
             
-            # Optimize
-            self.optimizer.step()
+            # For reporting, use the unscaled loss
+            if use_grad_accumulation:
+                unscaled_loss = loss.item() * grad_accumulation_steps
+                total_loss += unscaled_loss
+            else:
+                total_loss += loss.item()
             
             # Statistics
-            total_loss += loss.item()
             _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
-            # Update progress bar
+            # Update progress bar with unscaled loss for clarity
+            display_loss = loss.item() * grad_accumulation_steps if use_grad_accumulation else loss.item()
             pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
+                'loss': f"{display_loss:.4f}",
                 'acc': f"{100.0 * correct / total:.2f}%"
             })
             

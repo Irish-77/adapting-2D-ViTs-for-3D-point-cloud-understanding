@@ -109,7 +109,7 @@ def rotate_point_cloud_z(points):
     ])
     return points @ rotation_matrix
 
-def drop_and_replace_with_noise(point_cloud, drop_ratio=0.2, noise_std=0.02):
+def drop_and_replace_with_noise(point_cloud, drop_ratio=0.05, noise_std=0.02):
     """Drop points from the point cloud and replace them with noisy points.
     
     This augmentation randomly selects points to drop,
@@ -153,3 +153,39 @@ def drop_and_replace_with_noise(point_cloud, drop_ratio=0.2, noise_std=0.02):
     augmented_point_cloud[drop_indices] = random_points
     
     return augmented_point_cloud
+
+def random_rotate_point_cloud(points, ):
+    """Randomly rotate the point cloud around all axes.
+    
+    Args:
+        points (numpy.ndarray): Point cloud of shape (N, 3)
+        rotation_range (tuple): Range of rotation angles in radians
+        
+    Returns:
+        numpy.ndarray: Rotated point cloud
+    """
+    # Z-axis rotation (full)
+    angle_z = np.random.uniform(0, 2 * np.pi)
+    cos_z, sin_z = np.cos(angle_z), np.sin(angle_z)
+    R_z = np.array([[cos_z, -sin_z, 0],
+                    [sin_z, cos_z, 0],
+                    [0, 0, 1]])
+
+    # Y-axis rotation (limited, between +/- 15 degrees)
+    angle_y = np.random.uniform(-np.pi / 12, np.pi / 12)
+    cos_y, sin_y = np.cos(angle_y), np.sin(angle_y)
+    R_y = np.array([[cos_y, 0, sin_y],
+                    [0, 1, 0],
+                    [-sin_y, 0, cos_y]])
+    
+    # X-axis rotation (limited, between +/- 15 degrees)
+    angle_x = np.random.uniform(-np.pi / 12, np.pi / 12)
+    cos_x, sin_x = np.cos(angle_x), np.sin(angle_x)
+    R_x = np.array([[1, 0, 0],
+                    [0, cos_x, -sin_x],
+                    [0, sin_x, cos_x]])
+
+    # Combine rotations (Z -> Y -> X)
+    rotation_matrix = R_z @ R_y @ R_x
+    
+    return points @ rotation_matrix.T

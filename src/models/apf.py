@@ -197,19 +197,6 @@ class PointEmbedding(nn.Module):
         x = self.aggregation(x)  # (B*n_samples, embed_dim)
         x = x.reshape(B, n_samples, self.embed_dim)
         
-        # Add position embeddings
-        if n_samples <= self.pos_embed.shape[1]:
-            x = x + self.pos_embed[:, :n_samples, :]
-        else:
-            # Interpolate position embeddings if needed
-            pos_embed = F.interpolate(
-                self.pos_embed.transpose(1, 2),
-                size=n_samples,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-            x = x + pos_embed
-        
         return x, indices
 
 class AdapterLayer(nn.Module):

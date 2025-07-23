@@ -18,20 +18,26 @@ train_config = {
     'weight_decay': 5e-2,
     'save_interval': 5,
     'epochs': 100,
-    'use_lr_scheduler': False,
-    'clip_grad_norm': 0.0,
+    'use_lr_scheduler': True,
+    'clip_grad_norm': 10.0,
+    'save_views_interval': 1,
+    # New parameters for view transformation network
+    'view_learning_rate': 1e-3,     
+    'view_min_lr': 1e-7,            
+    'view_weight_decay': 1e-4,      
+    'view_warmup_epochs': 10,       
 }
 
 model_config = {
     'num_classes': 15,
     'vit_name': 'vit_b_16',
-    'adapter_dim': 64,
-    'num_views': 6,
+    'adapter_dim': 32,
+    'num_views': 3,
     'img_size': 224,
     'pretrained': True, 
-    'dropout_rate': 0.1,
+    'dropout_rate': 0.2,
     'diff_renderer': True,
-    'view_transform_hidden': 256,
+    'view_transform_hidden': 64,
 }
 
 trainer = RendererTrainer(
@@ -39,7 +45,7 @@ trainer = RendererTrainer(
     dataset_config=dataset_config,
     train_config=train_config,
     device='cuda',
-    output_dir='./output/renderer_training_diff' 
+    output_dir='./experiment/renderer/run_6' 
 )
 
 trainer.train()

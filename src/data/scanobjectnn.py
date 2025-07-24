@@ -2,17 +2,17 @@ import os
 import h5py
 import torch
 import numpy as np
-from typing import Optional, Tuple
-from torch.utils.data import Dataset
+from data.sampler import fps
 from data.augment import (
     normalize_point_cloud,
-    rotate_point_cloud_y,
-    rotate_point_cloud_z,
     random_scale_point_cloud, 
     random_jitter_point_cloud,
     drop_and_replace_with_noise,
     random_rotate_point_cloud
 )
+from torch.utils.data import Dataset
+from typing import Optional, Callable
+
 
 class ScanObjectNN(Dataset):
     """ScanObjectNN dataset for point cloud classification.
@@ -48,6 +48,8 @@ class ScanObjectNN(Dataset):
         use_custom_augmentation: bool = False,
         augmentation_probability: float = 0.2,
         sampling_method: str = 'all',
+        transform: Optional[Callable] = None,
+        use_height: bool = False
     ) -> None:
         """Initialize ScanObjectNN dataset.
         
@@ -64,8 +66,10 @@ class ScanObjectNN(Dataset):
             use_newsplit (bool): If True and using augmentedrot_scale75, uses the newsplit variant.
             use_custom_augmentation (bool): Whether to use custom augmentation techniques.
             augmentation_probability (float): Probability of applying custom augmentations.
-            sampling_method (str): Method for sampling points ('all', 'first', 'random'). 
+            sampling_method (str): Method for sampling points ('all', 'first', 'random', 'fps'). 
                                  If 'random', randomly samples points.
+            transform (Optional[Callable]): Optional transformations to apply to the point clouds.
+            use_height (bool): If True, appends height information to the point clouds.
         """
         self.root_dir = root_dir
         self.split = split
@@ -78,11 +82,20 @@ class ScanObjectNN(Dataset):
         self.use_custom_augmentation = use_custom_augmentation
         self.sampling_method = sampling_method
         self.augmentation_probability = augmentation_probability
+        self.transform = transform
+        self.use_height = use_height
         
         # Load data
         self.data, self.labels = self._load_data()
         self.num_classes = len(np.unique(self.labels))
-        
+
+        if self.num_points is not None and self.sampling_method == 'fps':
+            print("Applying FPS sampling to point clouds...")
+            # self.data = fps(self.data, self.num_points)
+            points = torch.from_numpy(self.data).float().cuda()
+            self.data = fps(points, self.num_points).cpu().numpy()
+            print(f"Sampled {self.num_points} points per point cloud.")
+
     def _load_data(self):
         """Load ScanObjectNN data based on configuration.
         
@@ -174,7 +187,7 @@ class ScanObjectNN(Dataset):
         if self.normalize:
             points = normalize_point_cloud(points)
                 
-        # Additional data augmentation for training (on top of pre-computed augmentations)
+        # Additional data augmentation for training
         if self.split == 'training':
             if self.use_custom_augmentation:
                 # Apply custom augmentation techniques
@@ -191,4 +204,26 @@ class ScanObjectNN(Dataset):
                 if np.random.random() > self.augmentation_probability:
                     points = drop_and_replace_with_noise(points, drop_ratio=0.2, noise_std=0.05)
             
-        return torch.FloatTensor(points), torch.LongTensor([label]).squeeze()
+        heights = None
+        if self.transform:
+            data = {'xyz': points, 'label': label}
+
+            for transform_func in self.transform:
+                data = transform_func(data)
+
+            label = data['label']
+            points = data['xyz']
+            heights = data['heights']
+         
+        if self.use_height and heights is not None:
+            points = torch.cat(
+                [
+                    torch.from_numpy(points).float(), # (Num points, 3)
+                    torch.from_numpy(heights).float()
+                ],
+                dim=1
+            )
+        else:
+            points = torch.from_numpy(points).float()
+
+        return points, torch.LongTensor([label]).squeeze()

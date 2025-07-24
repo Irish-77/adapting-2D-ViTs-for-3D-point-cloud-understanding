@@ -1,5 +1,52 @@
 import torch
-from typing import Tuple, Optional
+from typing import Tuple
+
+def furthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    Furthest point sampling algorithm for selecting a subset of points from a point cloud.
+    
+    Args:
+        xyz: Pointcloud data tensor of shape (B, N, 3) where B is batch size,
+             N is number of points, and 3 is the dimension of each point
+        npoint: Number of points to sample
+    
+    Returns:
+        torch.Tensor: Indices of sampled points with shape (B, npoint)
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
+    distance = torch.ones(B, N).to(device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        distance = torch.min(distance, dist)
+        farthest = torch.max(distance, -1)[1]
+    
+    return centroids
+
+
+def fps(data: torch.Tensor, number: int) -> torch.Tensor:
+    """
+    Performs furthest point sampling and gathers the sampled points.
+    
+    Args:
+        data: Input point cloud tensor of shape (B, N, C) where B is batch size,
+             N is number of points, and C is the dimension of each point
+        number: Number of points to sample
+    
+    Returns:
+        torch.Tensor: Sampled points with shape (B, number, C)
+    """
+    fps_idx = furthest_point_sample(data[:, :, :3].contiguous(), number)
+    fps_data = torch.gather(
+        data, 1, fps_idx.unsqueeze(-1).long().expand(-1, -1, data.shape[-1]))
+    return fps_data
+
 
 def _farthest_point_sampling(points: torch.Tensor, n_samples: int) -> torch.Tensor:
     """

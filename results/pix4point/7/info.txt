@@ -1,0 +1,14 @@
+pretrained model: vit-s
+epochs: 300
+batch_size: 48
+train: base
+frozen: false
+pretrained: false
+trainable percentage: 100%
+train acc: 65%
+test acc: 63%
+
+Notes:
+- Used cls_token and cls_pos from vit
+- Stopped weight decay on cls_token, cls_pos, bias, norm
+- Added weight init (everything except vit modules)

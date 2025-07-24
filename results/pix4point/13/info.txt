@@ -1,0 +1,12 @@
+pretrained model: vit-s
+epochs: 60/150
+batch_size: 48
+train: augmentedrot_scale75
+frozen: false
+pretrained: true
+trainable percentage: 100%
+train acc: 88%
+test acc: 29%
+
+Notes:
+ - changed epochs and t_max to 150

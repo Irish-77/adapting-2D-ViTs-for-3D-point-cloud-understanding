@@ -10,7 +10,8 @@ from data.augment import (
     rotate_point_cloud_z,
     random_scale_point_cloud, 
     random_jitter_point_cloud,
-    drop_and_replace_with_noise
+    drop_and_replace_with_noise,
+    random_rotate_point_cloud
 )
 
 class ScanObjectNN(Dataset):
@@ -177,10 +178,12 @@ class ScanObjectNN(Dataset):
         if self.split == 'training':
             if self.use_custom_augmentation:
                 # Apply custom augmentation techniques
+                # if np.random.random() > self.augmentation_probability:
+                #     points = rotate_point_cloud_y(points)
+                # if np.random.random() > self.augmentation_probability:
+                #     points = rotate_point_cloud_z(points)
                 if np.random.random() > self.augmentation_probability:
-                    points = rotate_point_cloud_y(points)
-                if np.random.random() > self.augmentation_probability:
-                    points = rotate_point_cloud_z(points)
+                    points = random_rotate_point_cloud(points)
                 if np.random.random() > self.augmentation_probability:
                     points = random_scale_point_cloud(points, scale_low=0.8, scale_high=1.2)
                 if np.random.random() > self.augmentation_probability:

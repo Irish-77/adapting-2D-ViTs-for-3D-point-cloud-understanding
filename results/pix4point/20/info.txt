@@ -1,0 +1,14 @@
+pretrained model: vit-b
+epochs: 66/150
+batch_size: 32
+train: augmentedrot_scale75
+frozen: false
+pretrained: true
+trainable percentage: 100%
+train acc: 96%
+test acc: 60%
+
+
+Notes:
+ - changed learning rate to 1e-4
+ - changed grad_norm_clip to 5

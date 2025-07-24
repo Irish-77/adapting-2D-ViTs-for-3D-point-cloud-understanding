@@ -1,0 +1,17 @@
+pretrained model: vit-b
+epochs: 50
+batch_size: 32
+train: base
+frozen: false
+pretrained: true
+trainable percentage: 100%
+train acc: 35%
+test acc: 25%
+
+Notes:
+- Missing:
+    - lr warmup
+    - lr cosine annealing
+    - cls_token and cls_pos from vit
+    - stopped weight decay on cls_token, cls_pos, bias, norm
+    - weight init (everything except vit modules)

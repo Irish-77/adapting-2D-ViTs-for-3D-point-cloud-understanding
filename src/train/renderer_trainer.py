@@ -64,6 +64,9 @@ class RendererTrainer:
         self._init_optimizer()
         self._init_metrics_csv()
         
+        # Current epoch tracker for warmup logic
+        self.current_epoch = 0
+        
     def _init_model(self) -> None:
         """Initialize the PointCloudRendererClassifier model.
         
@@ -147,20 +150,72 @@ class RendererTrainer:
         """Initialize optimizer and criterion.
         """
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.AdamW(
-            self.model.get_trainable_params(),
-            lr=self.train_config['learning_rate'],
-            weight_decay=self.train_config['weight_decay']
-        )
         
-        if self.train_config.get('use_lr_scheduler', False):
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.train_config['epochs'],
-                eta_min=self.train_config.get('min_lr', 1e-6)
+        # For differentiable renderer, set up separate optimizers
+        if self.model_config.get('diff_renderer', False):
+            # Get parameters for the view transformation network
+            view_transform_params = []
+            other_trainable_params = []
+            
+            for name, param in self.model.named_parameters():
+                if 'view_transform_net' in name and param.requires_grad:
+                    view_transform_params.append(param)
+                elif param.requires_grad:
+                    other_trainable_params.append(param)
+            
+            # Create two separate optimizers
+            self.optimizer = optim.AdamW(
+                other_trainable_params,
+                lr=self.train_config['learning_rate'],
+                weight_decay=self.train_config['weight_decay']
             )
+            
+            # Set up view transform optimizer with separate learning rate
+            self.view_optimizer = optim.AdamW(
+                view_transform_params,
+                lr=self.train_config.get('view_learning_rate', self.train_config['learning_rate'] * 0.1),
+                weight_decay=self.train_config.get('view_weight_decay', self.train_config['weight_decay'])
+            )
+            
+            # Set up schedulers
+            if self.train_config.get('use_lr_scheduler', False):
+                self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.train_config['epochs'],
+                    eta_min=self.train_config.get('min_lr', 1e-6)
+                )
+                
+                # Separate scheduler for view network - using ReduceLROnPlateau for better adaptivity
+                self.view_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    self.view_optimizer, 
+                    mode='max', 
+                    factor=0.5, 
+                    patience=5,
+                    min_lr=self.train_config.get('view_min_lr', 1e-7)
+                )
+            else:
+                self.scheduler = None
+                self.view_scheduler = None
         else:
-            self.scheduler = None
+            # Standard optimizer for non-diff renderer
+            self.optimizer = optim.AdamW(
+                self.model.get_trainable_params(),
+                lr=self.train_config['learning_rate'],
+                weight_decay=self.train_config['weight_decay']
+            )
+            
+            if self.train_config.get('use_lr_scheduler', False):
+                self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.train_config['epochs'],
+                    eta_min=self.train_config.get('min_lr', 1e-6)
+                )
+            else:
+                self.scheduler = None
+            
+            # These don't exist for non-diff renderer model
+            self.view_optimizer = None
+            self.view_scheduler = None
         
     def _init_metrics_csv(self) -> None:
         """Initialize the CSV file for tracking metrics.
@@ -243,7 +298,7 @@ class RendererTrainer:
         best_acc = 0.0
         
         for epoch in range(self.train_config['epochs']):
-            # Store current epoch for view saving logic
+            # Store current epoch for view saving logic and warmup
             self.current_epoch = epoch
             
             print(f"\nEpoch {epoch+1}/{self.train_config['epochs']}")
@@ -259,6 +314,16 @@ class RendererTrainer:
                 self.scheduler.step()
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"Learning rate: {current_lr:.6f}")
+                
+            # Update view network scheduler if using diff renderer
+            if hasattr(self, 'view_scheduler') and self.view_scheduler is not None:
+                if isinstance(self.view_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.view_scheduler.step(test_acc)  # Use accuracy as metric
+                else:
+                    self.view_scheduler.step()
+                    
+                current_view_lr = self.view_optimizer.param_groups[0]['lr']
+                print(f"View network learning rate: {current_view_lr:.6f}")
             
             # Update metrics CSV
             self._update_metrics_csv(epoch, train_loss, train_acc, test_loss, test_acc)
@@ -295,13 +360,34 @@ class RendererTrainer:
         correct = 0
         total = 0
         
+        # Check if we're in warmup period
+        warmup_epochs = self.train_config.get('view_warmup_epochs', 0)
+        in_warmup = self.current_epoch < warmup_epochs
+        
+        # If using diff renderer and in warmup, freeze view network
+        if self.model_config.get('diff_renderer', False) and in_warmup:
+            # Freeze view network during warmup
+            for name, param in self.model.named_parameters():
+                if 'view_transform_net' in name:
+                    param.requires_grad = False
+            print(f"Epoch {self.current_epoch+1}: In warmup phase - view transformation network frozen")
+        elif self.model_config.get('diff_renderer', False) and not in_warmup:
+            # Unfreeze view network after warmup
+            for name, param in self.model.named_parameters():
+                if 'view_transform_net' in name:
+                    param.requires_grad = True
+            if self.current_epoch == warmup_epochs:
+                print(f"Epoch {self.current_epoch+1}: Warmup complete - view transformation network unfrozen")
+        
         pbar = tqdm(self.train_loader, desc="Training")
         for points, labels in pbar:
             points = points.to(self.device)
             labels = labels.to(self.device)
             
-            # Zero the gradients
+            # Zero the gradients for all optimizers
             self.optimizer.zero_grad()
+            if self.model_config.get('diff_renderer', False) and not in_warmup:
+                self.view_optimizer.zero_grad()
             
             # Forward pass
             logits = self.model(points)
@@ -317,7 +403,10 @@ class RendererTrainer:
                     self.train_config['clip_grad_norm']
                 )
                 
+            # Step optimizers
             self.optimizer.step()
+            if self.model_config.get('diff_renderer', False) and not in_warmup:
+                self.view_optimizer.step()
             
             # Statistics
             total_loss += loss.item()
@@ -403,6 +492,12 @@ class RendererTrainer:
         if self.scheduler:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
+        # Save view optimizer state if using diff renderer
+        if self.model_config.get('diff_renderer', False):
+            checkpoint['view_optimizer_state_dict'] = self.view_optimizer.state_dict()
+            if self.view_scheduler:
+                checkpoint['view_scheduler_state_dict'] = self.view_scheduler.state_dict()
+        
         torch.save(checkpoint, os.path.join(self.output_dir, filename))
         print(f"Model checkpoint saved to {os.path.join(self.output_dir, filename)}")
         
@@ -427,6 +522,13 @@ class RendererTrainer:
         
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+        # Load view optimizer if using diff renderer
+        if self.model_config.get('diff_renderer', False):
+            if 'view_optimizer_state_dict' in checkpoint:
+                self.view_optimizer.load_state_dict(checkpoint['view_optimizer_state_dict'])
+            if self.view_scheduler and 'view_scheduler_state_dict' in checkpoint:
+                self.view_scheduler.load_state_dict(checkpoint['view_scheduler_state_dict'])
         
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']} with accuracy {checkpoint['accuracy']:.4f}")
         

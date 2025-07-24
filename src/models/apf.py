@@ -26,27 +26,20 @@ class MortonEncoder:
     Credits (**heavily** inspired by):
         - https://github.com/trevorprater/pymorton/blob/master/pymorton/pymorton.py
         - https://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
+        - ChatGPT helped with the vectorized implementation
     """
     
     @staticmethod
-    def part1by2(n: int) -> int:
-        """Separate bits by 2 positions to prepare for Morton encoding.
-        
-        This function takes an integer and spreads its bits apart, inserting two
-        zeros between each bit. This is a core operation in converting from
-        Cartesian coordinates to Morton code.
-        
-        For example, if n = 5 (binary 101), the function will transform it to
-        10001 (binary representation of 17), effectively separating each bit
-        by two positions.
+    def part1by2_vectorized(n: torch.Tensor) -> torch.Tensor:
+        """Vectorized version of part1by2 that operates on tensors.
         
         Args:
-            n: Integer value to process, representing a coordinate value.
+            n: Integer tensor to process, representing coordinate values.
             
         Returns:
-            Integer with bits separated by 2 positions.
+            Tensor with bits separated by 2 positions.
         """
-        n &= 0x000003ff
+        n = n & 0x000003ff
         n = (n ^ (n << 16)) & 0xff0000ff
         n = (n ^ (n << 8)) & 0x0300f00f
         n = (n ^ (n << 4)) & 0x030c30c3
@@ -54,28 +47,20 @@ class MortonEncoder:
         return n
     
     @staticmethod
-    def encode_morton3(x: int, y: int, z: int) -> int:
-        """Encode (x,y,z) coordinates to a single Morton code.
-        
-        This function combines three integer coordinates into a single Morton code
-        by interleaving their bits. Each coordinate is first processed with part1by2
-        to separate its bits, then they are combined so that the bits of x, y, and z
-        are interleaved in the pattern: z-y-x, z-y-x, etc.
-        
-        The resulting Morton code has the property that nearby points in 3D space
-        will typically have similar Morton codes, preserving spatial locality.
+    def encode_morton3_vectorized(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Vectorized version of encode_morton3 that operates on tensors.
         
         Args:
-            x: X-coordinate integer.
-            y: Y-coordinate integer.
-            z: Z-coordinate integer.
+            x: X-coordinate tensor.
+            y: Y-coordinate tensor.
+            z: Z-coordinate tensor.
             
         Returns:
-            Morton code representing the 3D position with interleaved bits.
+            Morton codes tensor.
         """
-        return (MortonEncoder.part1by2(z) << 2) + \
-               (MortonEncoder.part1by2(y) << 1) + \
-                MortonEncoder.part1by2(x)
+        return (MortonEncoder.part1by2_vectorized(z) << 2) + \
+               (MortonEncoder.part1by2_vectorized(y) << 1) + \
+                MortonEncoder.part1by2_vectorized(x)
     
     @staticmethod
     def points_to_morton(points: torch.Tensor, resolution: int = 1024) -> torch.Tensor:
@@ -86,12 +71,8 @@ class MortonEncoder:
         
         1. Normalize the points to fit within [0, resolution-1]
         2. Convert to integer coordinates
-        3. Compute Morton code for each point using encode_morton3
+        3. Compute Morton code for each point using encode_morton3_vectorized
         4. Return indices that would sort the points by their Morton codes
-        
-        The returned indices can be used to reorder the original points to follow
-        the Morton space-filling curve, which helps maintain spatial locality
-        when processing points sequentially.
         
         Args:
             points: Tensor of shape (B, N, 3) containing 3D coordinates.
@@ -109,14 +90,13 @@ class MortonEncoder:
         points_normalized = (points - points_min) / (points_max - points_min + 1e-8)
         points_discrete = (points_normalized * (resolution - 1)).long()
         
-        # Compute Morton codes
-        morton_codes = torch.zeros(B, N, dtype=torch.long, device=points.device)
-        for b in range(B):
-            for n in range(N):
-                x, y, z = points_discrete[b, n]
-                morton_codes[b, n] = MortonEncoder.encode_morton3(
-                    x.item(), y.item(), z.item()
-                )
+        # Extract x, y, z components
+        x = points_discrete[..., 0]  # (B, N)
+        y = points_discrete[..., 1]  # (B, N)
+        z = points_discrete[..., 2]  # (B, N)
+        
+        # Compute Morton codes for all points at once
+        morton_codes = MortonEncoder.encode_morton3_vectorized(x, y, z)  # (B, N)
         
         # Get sorting indices
         indices = torch.argsort(morton_codes, dim=1)
@@ -196,19 +176,6 @@ class PointEmbedding(nn.Module):
         # Final projection
         x = self.aggregation(x)  # (B*n_samples, embed_dim)
         x = x.reshape(B, n_samples, self.embed_dim)
-        
-        # Add position embeddings
-        if n_samples <= self.pos_embed.shape[1]:
-            x = x + self.pos_embed[:, :n_samples, :]
-        else:
-            # Interpolate position embeddings if needed
-            pos_embed = F.interpolate(
-                self.pos_embed.transpose(1, 2),
-                size=n_samples,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-            x = x + pos_embed
         
         return x, indices
 

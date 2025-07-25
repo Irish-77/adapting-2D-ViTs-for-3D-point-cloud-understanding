@@ -2,7 +2,7 @@ import math
 import timm
 import torch
 import torch.nn as nn
-from typing import cast, List, Optional, Tuple, Iterator
+from typing import cast, Iterator, List, Optional, Tuple
 
 
 def farthest_point_sampling(points: torch.Tensor, n_samples: int) -> torch.Tensor:
@@ -179,7 +179,7 @@ class P3Embed(nn.Module):
             dp = dp.permute(0, 3, 1, 2).contiguous() # (B, 3, n_smaples, k)
             fj = fj.permute(0, 3, 1, 2).contiguous()  # (B, D, n_samples, k)
 
-            fj = torch.cat([dp, fj], dim=1) # # (B, D+3, n_smaples, k)
+            fj = torch.cat([dp, fj], dim=1) # (B, D+3, n_smaples, k)
             fj = convs[0](fj)
             fj = torch.cat(
                 [self.pool(fj).expand(-1, -1, -1, self.k), fj], dim=1
@@ -197,6 +197,8 @@ class PointViT(nn.Module):
         in_channels: int = 3,
         embed_dim: int = 384,
         pretrained_model: str = "vit_small_patch16_384.augreg_in21k_ft_in1k",
+        pretrained: bool = True,
+        frozen: bool = False,
         k_neighbors: int = 16,
         global_features: str = 'max,cls'
     ):
@@ -215,12 +217,19 @@ class PointViT(nn.Module):
             nn.Linear(128, self.embed_dim)
         )
 
-        self.vit = timm.create_model(pretrained_model, pretrained=True)
+        self.vit = timm.create_model(pretrained_model, pretrained=pretrained)
+        total_params = sum(p.numel() for p in self.vit.parameters())
+        print(f"Total ViT Parameters: {total_params:,}")
         self.vit_blocks: nn.ModuleList = cast(nn.ModuleList, self.vit.blocks)
-        self.norm: nn.Module =cast(nn.Module, self.vit.norm)
+        self.norm: nn.Module = cast(nn.Module, self.vit.norm)
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.cls_pos = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.cls_token: nn.Parameter = cast(nn.Parameter, self.vit.cls_token)
+        self.cls_pos = nn.Parameter(cast(torch.Tensor, self.vit.pos_embed)[:, :1, :])
+
+        if frozen:
+            for name, param in self.named_parameters():
+                if 'vit' in name:
+                    param.requires_grad = False
 
     def forward(
         self, p: torch.Tensor, x: Optional[torch.Tensor] = None
@@ -228,15 +237,16 @@ class PointViT(nn.Module):
         if x is None:
             x = p.clone().transpose(1, 2).contiguous()
         feats = x
+        B, _, _ = feats.shape
 
         p_list, x_list = self.patch_embed(p, feats) # (B, 512, 3), (B, 512, 3)
-        center_p = p_list[-1] # (16, 512, 3)
+        center_p = p_list[-1] # (B, 512, 3)
 
         x = self.proj(x_list[-1].transpose(1, 2)) # (B, 512, 384)
-        pos_embed = self.pos_embed(center_p) # (16, 512, 384)
+        pos_embed = self.pos_embed(center_p) # (B, 512, 384)
 
-        pos_embed = [self.cls_pos.expand(feats.shape[0], -1, -1), pos_embed]
-        tokens = [self.cls_token.expand(feats.shape[0], -1, -1), x]
+        tokens = [self.cls_token.expand(B, -1, -1), x]
+        pos_embed = [self.cls_pos.expand(B, -1, -1), pos_embed]
 
         pos_embed = torch.cat(pos_embed, dim=1)
         feats = torch.cat(tokens, dim=1)
@@ -321,6 +331,8 @@ class Pix4Point(nn.Module):
         num_classes: int = 15,
         embed_dim: int = 768,
         pretrained_model: str = 'vit_small_patch16_384.augreg_in21k_ft_in1k',
+        pretrained: bool = True,
+        frozen: bool = False,
         k_neighbors: int = 16
     ) -> None:
         """Initialize the Pix4Point model.
@@ -335,10 +347,13 @@ class Pix4Point(nn.Module):
             embed_dim: Number of embedding dimension
         """
         super().__init__()
+        self.pretrained = pretrained
         self.model = PointViT(
             pretrained_model=pretrained_model,
+            pretrained=pretrained,
             embed_dim=embed_dim,
-            k_neighbors=k_neighbors
+            k_neighbors=k_neighbors,
+            frozen=frozen
         )
 
         self.cls_head = ClsHead(
@@ -346,6 +361,44 @@ class Pix4Point(nn.Module):
             num_classes=num_classes
         )
 
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        if not self.pretrained:
+            torch.nn.init.normal_(self.model.cls_token, std=.02)
+            torch.nn.init.normal_(self.model.cls_pos, std=.02)
+        for name, module in self.named_modules():
+            if name.startswith('vit') and self.pretrained:
+                continue  # skip ViT modules
+            self._init_weights(module)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+
+    def get_param_groups(self):
+        decay = []
+        no_decay = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue  # skip frozen params
+            if 'cls_token' in name or 'cls_pos' in name or name.endswith('.bias') or 'norm' in name:
+                no_decay.append(param)
+            else:
+                decay.append(param)
+
+        return [
+            {'params': decay},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ]
 
     def get_trainable_params(self) -> Iterator[nn.Parameter]:
         """Get only trainable parameters for optimizer.

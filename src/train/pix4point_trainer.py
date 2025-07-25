@@ -1,14 +1,17 @@
 import os
 import csv
 import torch
+import torch.distributed as dist
+import torch.utils.data.distributed
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Tuple
 
-from data import ScanObjectNN
-from models import Pix4Point
+from src.data import ScanObjectNN
+from src.models import Pix4Point
 
 class Pix4PointTrainer:
     """Trainer for the Pix4Point model on ScanObjectNN."""
@@ -42,8 +45,10 @@ class Pix4PointTrainer:
         self.model = Pix4Point(
             num_classes=self.model_config['num_classes'],
             pretrained_model=self.model_config['pretrained_model'],
+            pretrained=self.model_config['pretrained'],
             k_neighbors=self.model_config['k_neighbors'],
-            embed_dim=self.model_config['embed_dim']
+            embed_dim=self.model_config['embed_dim'],
+            frozen=self.model_config['frozen']
         )
         self.model.to(self.device)
         self.model.print_trainable_params()
@@ -83,21 +88,37 @@ class Pix4PointTrainer:
             batch_size=self.train_config['batch_size'],
             shuffle=True,
             num_workers=1,
-            drop_last=True,
+            drop_last=True
         )
         self.test_loader = DataLoader(
             self.test_dataset,
             batch_size=self.train_config['batch_size'],
             shuffle=False,
-            num_workers=1,
+            num_workers=1
         )
 
     def _init_optimizer(self) -> None:
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
-            self.model.get_trainable_params(),
+            self.model.get_param_groups(),
             lr=self.train_config['learning_rate'],
             weight_decay=self.train_config['weight_decay'],
+        )
+
+        warmup_scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda epoch: (epoch + 1) / self.train_config['warmup_epochs']
+        )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            self.train_config['t_max'],
+            eta_min=self.train_config['min_lr']
+        )
+
+        self.scheduler = optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[ self.train_config['warmup_epochs'] ]
         )
 
     def _init_metrics_csv(self) -> None:
@@ -142,12 +163,14 @@ class Pix4PointTrainer:
             logits = self.model(points)
             loss = self.criterion(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.train_config['grad_norm_clip'])
             self.optimizer.step()
             total_loss += loss.item()
             _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{100.0 * correct / total:.2f}%"})
+        self.scheduler.step()
         epoch_loss = total_loss / len(self.train_loader)
         epoch_acc = correct / total
         return epoch_loss, epoch_acc

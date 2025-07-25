@@ -1,0 +1,13 @@
+pretrained model: vit-s
+epochs: 30/60/300
+batch_size: 48
+train: augmentedrot_scale75
+frozen: false
+pretrained: true
+trainable percentage: 100%
+train acc: 71%
+test acc: 59%
+
+Notes:
+ - use augmentedrot_scale75
+ - changed augmentations to match the paper

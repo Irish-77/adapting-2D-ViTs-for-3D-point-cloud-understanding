@@ -1,0 +1,38 @@
+======== EXPERIMENT CONFIGURATION ========
+
+== MODEL CONFIGURATION ==
+num_classes: 15
+vit_name: vit_b_16
+adapter_dim: 64
+num_views: 2
+img_size: 224
+pretrained: True
+dropout_rate: 0.2
+diff_renderer: True
+view_transform_hidden: 128
+
+== DATASET CONFIGURATION ==
+root_dir: /home/stud226/h5_files
+split: training
+variant: main_split
+augmentation: base
+num_points: 2048
+normalize: True
+sampling_method: all
+use_custom_augmentation: True
+augmentation_probability: 0.4
+
+== TRAINING CONFIGURATION ==
+batch_size: 32
+min_lr: 1e-06
+learning_rate: 0.0005
+weight_decay: 0.05
+save_interval: 50
+epochs: 150
+use_lr_scheduler: True
+clip_grad_norm: 10.0
+
+== ENVIRONMENT ==
+Device: cuda
+Output directory: ./experiment/automated/renderer/num_views_2_diff_True_adapter_64_view_transform_128
+Timestamp: 2025-07-18_19-23-46

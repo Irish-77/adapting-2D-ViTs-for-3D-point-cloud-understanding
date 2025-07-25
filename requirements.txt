@@ -48,4 +48,3 @@ tqdm==4.67.1
 triton==3.3.1
 typing_extensions==4.12.2
 urllib3==2.5.0
--e git+ssh://git@github.com/Irish-77/adapting-2D-ViTs-for-3D-point-cloud-understanding.git@da9fc195c6f4045ba81950c542f12573bdf6bc98#egg=yourproject

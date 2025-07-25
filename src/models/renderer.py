@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models import get_vit
 from typing import Tuple, Iterator
-from models.apf import AdaptedViTBlock
+from models.apf_utils import AdaptedViTBlock
 from models.diff_renderer import DifferentiablePointCloudRenderer, ViewTransformationNetwork
 
 class PointCloudRenderer(nn.Module):

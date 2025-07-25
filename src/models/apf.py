@@ -1,494 +1,373 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from models import get_vit
-from typing import Optional, Tuple, Iterator, Callable
+from torch import nn
+from data.sampler import (
+    furthest_point_sample,
+    index_points,
+    knn_point
+)
+from models import get_timm_vit
+from models.apf_utils import APFViTLayer
+from models.apf_utils import MortonEncoder
 
-class MortonEncoder:
-    """Encodes 3D coordinates to Morton order (Z-order curve).
+class Group(nn.Module):
+    """Group points in a point cloud based on their spatial coordinates using Morton encoding"""
     
-    The MortonEncoder provides functionality to convert 3D point coordinates into
-    Morton order indices. Morton ordering (also known as Z-order curve) is a 
-    space-filling curve that preserves locality, meaning points that are close in 
-    3D space tend to be close in the 1D Morton ordering. This property is useful
-    for organizing point cloud data in a way that respects spatial locality.
+    def __init__(self, num_group: int, group_size: int):
+        """Initialize the Group module.
+        
+        Args:
+            num_group: Number of groups to create from the point cloud
+            group_size: Number of points in each group
+        """
+        super().__init__()
+        self.num_group = num_group
+        self.group_size = group_size
+        self.morton_encoder = MortonEncoder()
+
+    def _morton_sorting(self, xyz: torch.Tensor, center: torch.Tensor) -> torch.Tensor:
+        """Sorts the points based on their spatial coordinates using Morton encoding.
+        
+        Args:
+            xyz: Tensor of shape (B, N, C) with point coordinates
+            center: Tensor of shape (B, G, C) with group center coordinates
+
+        Returns:
+            Tensor of sorted indices
+        """
+        batch_size, num_points, _ = xyz.shape
+        distances_batch = torch.cdist(center, center)
+        distances_batch[:, torch.eye(self.num_group).bool()] = float("inf")
+        idx_base = torch.arange(
+            0, batch_size, device=xyz.device) * self.num_group
+
+        sorted_indices = self.morton_encoder.points_to_morton(center)
+        # For batched data, we need to adjust the indices
+        batch_size = center.shape[0]
+        idx_base = torch.arange(0, batch_size, device=xyz.device) * self.num_group
+        sorted_indices = sorted_indices + idx_base.unsqueeze(1)
+        sorted_indices = sorted_indices.view(-1)
+
+        return sorted_indices
     
-    The encoding process involves:
-    1. Normalizing point coordinates to a discrete grid
-    2. Interleaving the bits of the x, y, z coordinates
-    3. Creating a single integer value (Morton code) for each point
-    4. Sorting points based on their Morton codes
+    def forward(self, x: torch.tensor, xyz: torch.Tensor):
+        """ Forward pass to group points based on their spatial coordinates.
+        
+        Args:
+            x: Tensor of shape (B, N, C)
+            xyz: Tensor with spatial coordinates of shape
+
+        Returns:
+            neighborhood: Tensor of shape (B, G, nsample, C)
+            center: Tensor of shape (B, G, C)
+        """
+       
+        batch_size, num_points, _ = xyz.shape
+        xyz = xyz.contiguous()
+        
+        # Create evemly spaced groups
+        fps_idx = furthest_point_sample(xyz,self.num_group).long()
+        # Create anchor points
+        center = index_points(xyz,fps_idx)
+        new_points = index_points(x,fps_idx)
+        # Associate points to the nearest center
+        idx = knn_point(self.group_size, xyz, center)  # B G nsample
+        idx_base = torch.arange(
+            0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
+        idx = idx + idx_base
+        idx = idx.view(-1)
+        neighborhood = x.view(batch_size * num_points, -1)[idx, :]
+        neighborhood = neighborhood.view(
+            batch_size, self.num_group, self.group_size, -1).contiguous() # B,G,nsample,3
+        
+        # Normalize neighborhood
+        mean_x = new_points.unsqueeze(dim=-2)
+        neighborhood = (neighborhood - mean_x)
+        # Concats:
+        # 1. Local point features
+        # 2. Features of its group center
+        neighborhood = torch.cat(
+            [
+                neighborhood,
+                # Operations just make sure that dimensions match to neighborhood
+                new_points.unsqueeze(2).repeat(1, 1, self.group_size, 1)
+            ],
+            dim = -1
+        )
+
+        # Sort the neighborhood and center based on the Morton code (it looks like Z curves)
+        # For more informatio, see docu of MortonEncoder class
+        sorted_indices = self._morton_sorting(xyz, center)
+        # Now we do sorting based on Morton results
+        # Rearrange the neighborhood point group
+        neighborhood = neighborhood.view(
+            batch_size * self.num_group, self.group_size, -1)[sorted_indices, :, :]
+        neighborhood = neighborhood.view(
+            batch_size, self.num_group, self.group_size, -1).contiguous()
+        # Repeat for center points
+        center = center.view(
+            batch_size * self.num_group, -1)[sorted_indices, :]
+        center = center.view(
+            batch_size, self.num_group, -1).contiguous()
+
+        return neighborhood, center
+
+class Encoder(nn.Module):
+    """Feature encoder for point groups using shared MLPs.
     
-    This ordering helps preserve spatial relationships when processing point clouds
-    sequentially, which is especially beneficial for transformer architectures
-    that rely on sequential data.
-    
-    Credits (**heavily** inspired by):
-        - https://github.com/trevorprater/pymorton/blob/master/pymorton/pymorton.py
-        - https://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
-        - ChatGPT helped with the vectorized implementation
+    Extracts features & local structures from point groups using MLPs.
     """
     
-    @staticmethod
-    def part1by2_vectorized(n: torch.Tensor) -> torch.Tensor:
-        """Vectorized version of part1by2 that operates on tensors.
+    def __init__(self, encoder_channel: int, in_channel: int):
+        """Initialize the Encoder module.
         
         Args:
-            n: Integer tensor to process, representing coordinate values.
-            
-        Returns:
-            Tensor with bits separated by 2 positions.
-        """
-        n = n & 0x000003ff
-        n = (n ^ (n << 16)) & 0xff0000ff
-        n = (n ^ (n << 8)) & 0x0300f00f
-        n = (n ^ (n << 4)) & 0x030c30c3
-        n = (n ^ (n << 2)) & 0x09249249
-        return n
-    
-    @staticmethod
-    def encode_morton3_vectorized(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Vectorized version of encode_morton3 that operates on tensors.
-        
-        Args:
-            x: X-coordinate tensor.
-            y: Y-coordinate tensor.
-            z: Z-coordinate tensor.
-            
-        Returns:
-            Morton codes tensor.
-        """
-        return (MortonEncoder.part1by2_vectorized(z) << 2) + \
-               (MortonEncoder.part1by2_vectorized(y) << 1) + \
-                MortonEncoder.part1by2_vectorized(x)
-    
-    @staticmethod
-    def points_to_morton(points: torch.Tensor, resolution: int = 1024) -> torch.Tensor:
-        """Convert points to Morton order and return sorting indices.
-        
-        This method processes a batch of 3D point clouds and converts each point
-        to its corresponding Morton code. The steps are:
-        
-        1. Normalize the points to fit within [0, resolution-1]
-        2. Convert to integer coordinates
-        3. Compute Morton code for each point using encode_morton3_vectorized
-        4. Return indices that would sort the points by their Morton codes
-        
-        Args:
-            points: Tensor of shape (B, N, 3) containing 3D coordinates.
-            resolution: Discretization resolution for normalizing coordinates.
-                       Higher values provide more precise spatial encoding.
-            
-        Returns:
-            Tensor of shape (B, N) containing indices for sorting by Morton order.
-        """
-        B, N, _ = points.shape
-        
-        # Normalize points to [0, resolution)
-        points_min = points.min(dim=1, keepdim=True)[0]
-        points_max = points.max(dim=1, keepdim=True)[0]
-        points_normalized = (points - points_min) / (points_max - points_min + 1e-8)
-        points_discrete = (points_normalized * (resolution - 1)).long()
-        
-        # Extract x, y, z components
-        x = points_discrete[..., 0]  # (B, N)
-        y = points_discrete[..., 1]  # (B, N)
-        z = points_discrete[..., 2]  # (B, N)
-        
-        # Compute Morton codes for all points at once
-        morton_codes = MortonEncoder.encode_morton3_vectorized(x, y, z)  # (B, N)
-        
-        # Get sorting indices
-        indices = torch.argsort(morton_codes, dim=1)
-        return indices
-
-class PointEmbedding(nn.Module):
-    """Point cloud embedding and sequencing module for grouped points."""
-    
-    def __init__(self, embed_dim: int = 768, k_neighbors: int = 16, dropout_rate: float = 0.1) -> None:
-        """Initialize the PointEmbedding module.
-        
-        Args:
-            embed_dim: Dimension of the embedding output.
-            k_neighbors: Number of nearest neighbors for point grouping.
-            dropout_rate: Dropout rate for regularization.
+            encoder_channel: Number of channels for the encoder MLPs
+            in_channel: Number of input channels for the point features
         """
         super().__init__()
-        self.embed_dim = embed_dim
-        self.k_neighbors = k_neighbors
-        # (B*n_samples, k, 3) -> Output: (B*n_samples, embed_dim)
-        self.group_embed = nn.Sequential(
-            nn.Conv1d(3, 64, 1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(64, 128, 1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(128, 256, 1),
+        self.encoder_channel = encoder_channel
+        self.first_conv = nn.Sequential(
+            nn.Conv1d(in_channel, 256, 1),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
+            nn.Conv1d(256, 512, 1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(512, self.encoder_channel, 1)
         )
-        
-        # Aggregation layer
-        self.aggregation = nn.Sequential(
-            nn.Linear(256, embed_dim),
-            nn.Dropout(dropout_rate)
+        self.second_conv = nn.Sequential(
+            nn.Conv1d(self.encoder_channel*2, self.encoder_channel*2, 1),
+            nn.BatchNorm1d(self.encoder_channel*2),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(self.encoder_channel*2, self.encoder_channel, 1)
         )
-        
-        # Learnable position embedding
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1024, embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        
-    def forward(self, grouped_points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process grouped points through the embedding network.
-        
-        Args:
-            grouped_points: Tensor of shape (B, n_samples, k, 3) with grouped 3D coordinates.
-            
-        Returns:
-            tuple: A tuple containing:
-                - embedded points: Tensor of shape (B, n_samples, embed_dim)
-                - indices: Tensor of shape (B, n_samples) with Morton ordering indices
-        """
-        B, n_samples, k, _ = grouped_points.shape
-        
-        # Get centroids (mean of each group) for Morton ordering
-        centroids = grouped_points.mean(dim=2)  # (B, n_samples, 3)
-        
-        # Apply Morton ordering to centroids
-        indices = MortonEncoder.points_to_morton(centroids)
-        
-        # Reorder grouped points according to Morton order
-        grouped_points = torch.gather(
-            grouped_points, 
-            1, 
-            indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, k, 3)
-        )
-        
-        # Embed grouped points
-        # Reshape for conv1d: (B*n_samples, k, 3) -> (B*n_samples, 3, k)
-        x = grouped_points.reshape(B * n_samples, k, 3).transpose(1, 2)
-        x = self.group_embed(x)  # (B*n_samples, 256, k)
-        
-        # Max pooling over neighbors
-        x = F.max_pool1d(x, kernel_size=k).squeeze(-1)  # (B*n_samples, 256)
-        
-        # Final projection
-        x = self.aggregation(x)  # (B*n_samples, embed_dim)
-        x = x.reshape(B, n_samples, self.embed_dim)
-        
-        return x, indices
 
-class AdapterLayer(nn.Module):
-    """Adapter layer for parameter-efficient fine-tuning."""
-    
-    def __init__(self, embed_dim: int, adapter_dim: int = 64) -> None:
-        """Initialize the adapter layer.
+    def get_features(self, point_groups: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to extract features from point groups.
         
         Args:
-            embed_dim: Dimension of the input and output embeddings.
-            adapter_dim: Dimension of the bottleneck in the adapter.
+            point_groups: Tensor of shape (B, G, N, C) where B is batch size, G is number of groups, N is number of points per group, and C is number of channels.
+
+        Returns:
+            Tensor of shape (B, G, C) representing the global feature for each group.
+        """
+        B, G, N, _ = point_groups.shape
+        # Reshape to BG N 3
+        point_groups = point_groups.reshape(B * G, N, -1)
+        # Apply first conv
+        feature = self.first_conv(point_groups.transpose(2, 1))
+        feature_global = torch.max(feature, dim=2, keepdim=True)[0]
+        # Concat global feature with local features
+        feature = torch.cat(
+            [feature_global.expand(-1, -1, N), feature], dim=1)
+        # Apply second conv
+        feature = self.second_conv(feature)
+        # Retrieve global feature
+        feature_global = torch.max(feature, dim=2, keepdim=False)[0]
+        # Reshape back to B G C
+        return feature_global.reshape(B, G, self.encoder_channel)
+
+    def forward(self, point_groups: torch.Tensor) -> torch.Tensor:
+        """Extract features from point groups.
+        
+        Args:
+            point_groups: Tensor of shape (B, G, N, C)
+
+        Returns:
+            Tensor of shape (B, G, C) with extracted features
+        """
+        feature = self.get_features(point_groups)
+        return feature
+
+class PointNet(nn.Module):
+    """PointNet-based feature extractor for point clouds
+    
+    Groups points, encodes the groups into features (permutation invariant).
+    """
+    
+    def __init__(self, embed_dim: int, num_group: int, group_size: int, in_channel: int):
+        """Initialize the PointNet module.
+        
+        Args:
+            embed_dim: Dimension of the embedding space
+            num_group: Number of groups to create from the point cloud
+            group_size: Number of points in each group
+            in_channel: Number of input channels for the point features
         """
         super().__init__()
-        self.down_proj = nn.Linear(embed_dim, adapter_dim)
-        self.up_proj = nn.Linear(adapter_dim, embed_dim)
-        self.act = nn.GELU()
-        
-        # Initialize with near-identity
-        nn.init.xavier_uniform_(self.down_proj.weight, gain=1e-3)
-        nn.init.zeros_(self.down_proj.bias)
-        nn.init.zeros_(self.up_proj.weight)
-        nn.init.zeros_(self.up_proj.bias)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Process input through the adapter layer.
-        
-        Args:
-            x: Input tensor of shape (..., embed_dim).
-            
-        Returns:
-            Output tensor of shape (..., embed_dim) after adaptation.
-        """
-        return x + self.up_proj(self.act(self.down_proj(x)))
+        self.group = Group(num_group, group_size)
+        self.encoder = Encoder(embed_dim, in_channel)
 
-class AdaptedViTBlock(nn.Module):
-    """ViT block with adapter layers for parameter-efficient fine-tuning."""
-    
-    def __init__(self, vit_block: nn.Module, adapter_dim: int = 64) -> None:
-        """Initialize the adapted ViT block.
-        
-        Args:
-            vit_block: Original Vision Transformer block to be adapted.
-            adapter_dim: Dimension of the bottleneck in the adapters.
-        """
-        super().__init__()
-        self.vit_block = vit_block
-        
-        # Get the hidden dimension from the layer normalization
-        hidden_dim = vit_block.ln_1.normalized_shape[0]
-        
-        self.adapter1 = AdapterLayer(hidden_dim, adapter_dim)
-        self.adapter2 = AdapterLayer(hidden_dim, adapter_dim)
-        
-        # Freeze ViT parameters
-        for param in self.vit_block.parameters():
-            param.requires_grad = False
-            
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Process input through the adapted ViT block.
+        """Extract features from the point cloud.
         
         Args:
-            x: Input tensor.
+            x: Input tensor of shape (B, N, C) where B is batch size, N is number of points, and C is number of channels
+
+        Returns:
+            Tensor of shape (B, G, C) with extracted features
+        """
+        # Extract xyz coordinates
+        xyz = x[:,:,:3]
+        # Group points
+        new_points, new_xyz = self.group(x,xyz)
+        # Encode grouped points
+        new_points = self.encoder(new_points)
+        return new_points
+
+class ClassificationHead(nn.Module):
+    """Classification head that processes high-dimensional features into class predictions"""
+    
+    def __init__(self, in_channels: int, num_classes: int):
+        """Initialize the classification head.
+        
+        Args:
+            in_channels: Dimension of input features
+            num_classes: Number of output classes for classification
+        """
+        super(ClassificationHead, self).__init__()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(in_channels,512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.4),
+            nn.Linear(512,256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.4),
+            nn.Linear(256,num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Process features through the classification head.
+        
+        Args:
+            x: Input features tensor of shape (B, in_channels) where B is batch size
             
         Returns:
-            Output tensor after processing through the adapted block.
+            Class logits tensor of shape (B, num_classes)
         """
-        # Self-attention block with adapter
-        y = self.vit_block.ln_1(x)
-        y, _ = self.vit_block.self_attention(y, y, y, need_weights=False)
-        y = self.vit_block.dropout(y)
-        y = self.adapter1(y)
-        x = x + y
-        
-        # MLP block with adapter
-        y = self.vit_block.ln_2(x)
-        y = self.vit_block.mlp(y)
-        y = self.adapter2(y)
-        x = x + y
-        
-        return x
+        return self.mlp_head(x)
 
 class AdaptPointFormer(nn.Module):
-    """Main Adapt PointFormer model with integrated FPS sampling.
-    
+    """Adapted PointFormer model for point cloud classification.
+
     Implementation according to the paper:
     https://arxiv.org/pdf/2407.13200
 
     The official implementation can be found here:
     https://github.com/Dali936/APF
 
-    However, this implementation used some design choices that we did not like,
-    so we decided to implement our own version (also this was part of the project either way).
+    Note: some blocks were adapted as the paper description is in some parts not clear.
     """
     
     def __init__(
         self,
-        num_classes: int = 40,
-        num_points: int = 1024,
-        n_samples: int = 512,
-        k_neighbors: int = 16,
-        vit_name: str = 'vit_b_16',
-        adapter_dim: int = 64,
+        num_classes: int = 15,
+        embedding_dim: int = 768,
+        vit_name: str = 'vit_base_patch16_224',
         pretrained: bool = True,
-        dropout_rate: float = 0.1
+        npoint: int = 196,
+        nsample: int = 32,
+        in_channels: int = 3,
+        dropout_rate: float = 0.1,
+        dropout_path_rate: float = 0.1,
     ) -> None:
         """Initialize the AdaptPointFormer model.
-        
+
         Args:
-            num_classes: Number of output classes for classification.
-            num_points: Number of points in the input point cloud.
-            n_samples: Number of samples after FPS sampling.
-            k_neighbors: Number of nearest neighbors in point grouping.
-            vit_name: Name of the Vision Transformer backbone to use.
-            adapter_dim: Dimension of the bottleneck in adapter layers.
-            pretrained: Whether to use pretrained weights for the ViT.
-            dropout_rate: Dropout rate for regularization.
+            num_classes: Number of output classes for classification
+            embedding_dim: Dimension of the embedding space
+            vit_name: Name of the ViT architecture to use
+            pretrained: Whether to load pre-trained weights for the ViT
+            npoint: Number of points to sample for each point cloud
+            nsample: Number of points to sample in each group
+            in_channels: Number of input channels for the point features
+            dropout_rate: Dropout rate for the model
+            dropout_path_rate: Dropout path rate for the model
         """
         super().__init__()
-        
-        # Load pre-trained ViT
-        self.vit, self.embed_dim = get_vit(vit_name, pretrained)
-        self.num_points = num_points
-        self.n_samples = n_samples
-        self.k_neighbors = k_neighbors
-        
-        # Point embedding module - now handles grouped points
-        self.point_embed = PointEmbedding(
-            embed_dim=self.embed_dim,
-            k_neighbors=k_neighbors,
-            dropout_rate=dropout_rate
-        )
-        
-        # Replace ViT blocks with adapted versions
-        encoder_blocks = []
-        for block in self.vit.encoder.layers:
-            encoder_blocks.append(AdaptedViTBlock(block, adapter_dim))
-        self.vit.encoder.layers = nn.Sequential(*encoder_blocks)
-        
-        # Replace the ViT head
-        self.vit.heads = nn.Identity()
-        
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(self.embed_dim),
-            nn.Linear(self.embed_dim, 256),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(256, num_classes)
-        )
-        
-        # Freeze all ViT parameters except adapters
-        for name, param in self.named_parameters():
-            if 'adapter' not in name and 'point_embed' not in name and 'classifier' not in name:
-                param.requires_grad = False
-    
-    def forward(self, points: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the model.
-        
-        Args:
-            points: Either tensor of shape (B, N, 3) with raw points or 
-                  tensor of shape (B, n_samples, k, 3) with grouped points.
-            
-        Returns:
-            Classification logits of shape (B, num_classes).
-            
-        Raises:
-            ValueError: If raw points are provided without FPS sampling implementation.
-        """
-        # Check if input is already grouped or raw points
-        if len(points.shape) == 4:
-            # Already grouped points (B, n_samples, k, 3)
-            grouped_points = points
-            B, n_samples, k, _ = grouped_points.shape
-        else:
-            # Raw points (B, N, 3) - need to apply FPS sampling
-            B, N, _ = points.shape
-            # TODO: Check if fps sampling can be introduced here, and if this will make AdaptPointFormerWithSampling obsolete
-            # For now, current setup works...
-            raise ValueError("Raw points input requires FPS sampling. Please provide grouped points or implement FPS sampling.")
-        
-        # Embed and sequence grouped points
-        x, indices = self.point_embed(grouped_points)  # (B, n_samples, embed_dim)
-        
-        # Prepare for ViT (add CLS token)
-        cls_token = self.vit.class_token.expand(B, -1, -1)
-        x = torch.cat([cls_token, x], dim=1)
-        
-        # Add position embeddings from ViT
-        # Interpolate ViT position embeddings to match number of points
-        vit_pos_embed = self.vit.encoder.pos_embedding[:, 1:, :]  # Remove CLS position
-        if n_samples != vit_pos_embed.shape[1]:
-            vit_pos_embed = F.interpolate(
-                vit_pos_embed.transpose(1, 2),
-                size=n_samples,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-        
-        cls_pos_embed = self.vit.encoder.pos_embedding[:, :1, :]
-        pos_embed = torch.cat([cls_pos_embed, vit_pos_embed], dim=1)
-        x = x + pos_embed
-        
-        # Apply ViT encoder with adapters
-        x = self.vit.encoder.dropout(x)
-        x = self.vit.encoder.layers(x)
-        x = self.vit.encoder.ln(x)
-        
-        # Extract CLS token and classify
-        cls_output = x[:, 0]
-        logits = self.classifier(cls_output)
-        
-        return logits
-    
-    def get_trainable_params(self) -> Iterator[nn.Parameter]:
-        """Get only trainable parameters for optimizer.
-        
-        Returns:
-            Iterator over trainable parameters of the model.
-        """
-        return filter(lambda p: p.requires_grad, self.parameters())
-    
-    def print_trainable_params(self) -> None:
-        """Print statistics about trainable parameters.
-        
-        Displays the total number of parameters, trainable parameters,
-        and percentage of trainable parameters in the model.
-        """
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Trainable percentage: {100 * trainable_params / total_params:.2f}%")
 
+        # Multiply in_channels by 2 as model expects grouped features
+        in_channels = in_channels * 2
 
-# Wrapper to integrate FPS sampling with the model
-class AdaptPointFormerWithSampling(nn.Module):
-    """Wrapper that handles FPS sampling before the model."""
-    
-    def __init__(
-        self,
-        num_classes: int = 15,
-        num_points: int = 1024,
-        vit_name: str = 'vit_b_16',
-        adapter_dim: int = 64,
-        pretrained: bool = True,
-        dropout_rate: float = 0.1,
-        fps_sampling_func: Optional[Callable[[torch.Tensor, int, int], torch.Tensor]] = None,
-        n_samples: int = 512,
-        k_neighbors: int = 16,
-    ) -> None:
-        """Initialize the AdaptPointFormerWithSampling model.
+        depth = 12
         
-        Args:
-            num_classes: Number of output classes for classification.
-            num_points: Number of points in the input point cloud.
-            vit_name: Name of the Vision Transformer backbone to use.
-            adapter_dim: Dimension of the bottleneck in adapter layers.
-            pretrained: Whether to use pretrained weights for the ViT.
-            dropout_rate: Dropout rate for regularization.
-            fps_sampling_func: Function to perform FPS sampling with k-NN grouping.
-            n_samples: Number of samples after FPS sampling.
-            k_neighbors: Number of nearest neighbors in point grouping.
-        """
-        super().__init__()
-        self.model = AdaptPointFormer(
+        # Calculate dropout path rates: the more layers, the more dropout
+        dpr = [x.item() for x in torch.linspace(0, dropout_path_rate, depth)]
+
+        # Model components
+        self.dropout = nn.Dropout(dropout_rate)
+        self.encoder_norm = nn.LayerNorm(embedding_dim)
+        self.point_encoder = PointNet(
+            embedding_dim,
+            npoint,
+            nsample,
+            in_channels,
+        )
+        self.head = ClassificationHead(
+            in_channels=embedding_dim,
             num_classes=num_classes,
-            num_points=num_points,
-            vit_name=vit_name,
-            adapter_dim=adapter_dim,
+        )
+        self.blocks = nn.Sequential(*[
+            APFViTLayer(
+                dim = embedding_dim,
+                num_heads = 12,
+                drop_path = dpr[i],
+                dropout = dropout_rate
+            )
+            for i in range(depth)])
+
+        # Load pre-trained ViT weights
+        vit_state_dict = get_timm_vit(
+            vit_name,
             pretrained=pretrained,
-            dropout_rate=dropout_rate
+            delete=['head.weight', 'head.bias']
+        )
+        # Load the state dict into this model
+        self.load_state_dict(
+            vit_state_dict, strict=False
         )
 
-        self.fps_sampling_func = fps_sampling_func
-        self.n_samples = n_samples
-        self.k_neighbors = k_neighbors
-    
-    def get_trainable_params(self) -> Iterator[nn.Parameter]:
-        """Get only trainable parameters for optimizer.
-        
-        Returns:
-            Iterator over trainable parameters of the underlying model.
-        """
-        return filter(lambda p: p.requires_grad, self.model.parameters())
-    
-    def print_trainable_params(self) -> None:
-        """Print statistics about trainable parameters.
-        
-        Displays the total number of parameters, trainable parameters,
-        and percentage of trainable parameters in the underlying model.
-        """
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Trainable percentage: {100 * trainable_params / total_params:.2f}%")
+        self._freeze()
 
-    def forward(self, points: torch.Tensor) -> torch.Tensor:
-        """Forward pass with integrated FPS sampling.
+    def _freeze(self):
+        """
+        Freezes the model parameters.
+        """
+        # First, freeze all parameters
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        # Then, unfreeze specific layers
+        for name, param in self.named_parameters():
+            if 'adaptmlp' in name or 'head' in name or 'enc_norm' in name or 'encoder' in name:
+                param.requires_grad = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the AdaptPointFormer model.
         
         Args:
-            points: Tensor of shape (B, N, 3) containing raw point clouds.
-            
+            x: Input tensor of shape (B, N, C) where B is batch size, N is number of points, and C is number of channels
+
         Returns:
-            Classification logits of shape (B, num_classes).
+            Tensor of shape (B, num_classes) with class logits
         """
-        # Apply FPS sampling with k-NN
-        grouped_points = self.fps_sampling_func(
-            points, 
-            n_samples=self.n_samples, 
-            k=self.k_neighbors
-        )
+        # Get point grouping and encoding
+        x = self.point_encoder(x)
+
+        # Pass through ViT with Adaption Layer
+        for i in range(len(self.blocks)):
+            x = self.blocks[i](x)
+
+        x = self.encoder_norm(x)
+        # Global pooling
+        x = x.max(-2)[0]
         
-        # Forward through the model
-        return self.model(grouped_points)
+        x = self.dropout(x)
+
+        # Final classification head
+        x = self.head(x)
+
+        return x

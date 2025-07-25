@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg import expm, norm
 
 def normalize_point_cloud(points):
     """Normalize point cloud to be centered at origin and scaled to unit sphere.
@@ -188,3 +189,120 @@ def random_rotate_point_cloud(points):
     rotation_matrix = R_z @ R_y @ R_x
     
     return points @ rotation_matrix.T
+
+def scale_point_cloud(
+    data,
+    scale_range=(0.9, 1.1),
+    anisotropic=True, 
+    scale_xyz=(True, True, True)
+):
+    """
+    Scale point cloud with optional anisotropic scaling and mirroring.
+    
+    Args:
+        data: dict containing 'xyz' key with point cloud
+        scale_range: tuple of (min_scale, max_scale)
+        anisotropic: if True, scale each axis independently
+        scale_xyz: tuple of bools, whether to scale each axis
+    
+    Returns:
+        dict containing 'xyz'
+    """
+    points = data['xyz'].copy()
+    
+    # Generate random scale
+    if anisotropic:
+        scale = np.random.uniform(scale_range[0], scale_range[1], size=3)
+    else:
+        scale_val = np.random.uniform(scale_range[0], scale_range[1])
+        scale = np.array([scale_val, scale_val, scale_val])
+    
+    # Apply scale_xyz mask
+    for i, should_scale in enumerate(scale_xyz):
+        if not should_scale:
+            scale[i] = 1.0
+    
+    data['xyz'] = points * scale
+    return data
+
+def center_and_normalize_point_cloud(
+    data,
+    center=True,
+    normalize=True, 
+    gravity_dim=1
+):
+    """
+    Center and normalize point cloud.
+    
+    Args:
+        data: dict containing 'xyz' key with point cloud
+        center: whether to center the point cloud
+        normalize: whether to normalize to unit sphere
+        gravity_dim: dimension index for height (default 1)
+    Returns:
+       dict containing 'xyz' and heights
+    """
+    points = data['xyz'].copy()
+
+    heights = points[:, gravity_dim:gravity_dim + 1]
+    data['heights'] = heights - np.min(heights, axis=0)
+    
+    if center:
+        centroid = np.mean(points, axis=0)
+        points = points - centroid
+    
+    if normalize:
+        distances = np.sqrt(np.sum(points ** 2, axis=1))
+        max_dist = np.max(distances)
+        if max_dist > 0:
+            points = points / max_dist
+
+    data['xyz'] = points
+    return data
+
+def rotate_point_cloud(data, angle=(0.0, 1.0, 0.0), angle_units='radians'):
+    """
+    Apply random rotation to point cloud.
+    
+    Args:
+        data: dict containing 'xyz' key with point cloud
+        angle: tuple of rotation bounds for each axis (x, y, z)
+        angle_units: 'radians' or 'degrees'
+    
+    Returns:
+        dict containing 'xyz'
+    """
+    points = data['xyz'].copy()
+    
+    # Convert to radians if needed
+    if angle_units == 'degrees':
+        angle = np.array(angle) * np.pi / 180
+    else:
+        angle = np.array(angle)
+    
+    # Generate rotation matrices for each axis
+    rot_matrices = []
+    for axis_idx, rot_bound in enumerate(angle):
+        if rot_bound != 0:
+            # Random angle within bounds
+            theta = np.random.uniform(-rot_bound, rot_bound)
+            
+            # Create axis vector
+            axis = np.zeros(3)
+            axis[axis_idx] = 1
+            
+            # Create rotation matrix using Rodrigues' formula
+            rot_mat = expm(np.cross(np.eye(3), axis / norm(axis) * theta))
+            rot_matrices.append(rot_mat)
+        else:
+            rot_matrices.append(np.eye(3))
+    
+    # Combine rotations in random order
+    indices = np.random.permutation(3)
+    combined_rot = np.eye(3)
+    for i in indices:
+        combined_rot = combined_rot @ rot_matrices[i]
+    
+    data['xyz'] = points @ combined_rot.T
+
+    return data

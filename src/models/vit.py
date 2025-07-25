@@ -1,4 +1,7 @@
+import timm
+import torch.nn as nn
 import torchvision.models as models
+from typing import Optional
 
 def get_vit(
     vit_name: str, 
@@ -32,3 +35,32 @@ def get_vit(
         raise ValueError(f"Unsupported ViT model: {vit_name}")
     
     return model, embed_dim
+
+
+def get_timm_vit(
+    name: str,
+    pretrained: bool = True,
+    delete: Optional[list[str]] = None,
+) -> nn.Module:
+    """
+    Load a Vision Transformer model from timm library by name
+    
+    Args:
+        name: Name of the ViT model to load
+        pretrained: Whether to load pretrained weights
+        delete: Optional parameter containing specific layers or attributes to delete from the state_dict
+    
+    Returns:
+        model: The loaded ViT model; if delete is not None, state_dict is returned
+    """
+    
+    model = timm.create_model(name, pretrained=pretrained)
+    if delete is None:
+        return model
+
+    state_dict = model.state_dict()
+    for d in delete:
+        if d in state_dict:
+            del state_dict[d]
+
+    return state_dict

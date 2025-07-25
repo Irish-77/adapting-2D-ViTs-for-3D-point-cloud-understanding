@@ -1,19 +1,21 @@
 import os
 import csv
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 
 from tqdm import tqdm
-from typing import  Tuple, Optional
+from typing import Tuple
 from data import ScanObjectNN
-from datetime import datetime
+from data.augment import (
+    scale_point_cloud,
+    center_and_normalize_point_cloud,
+    rotate_point_cloud,
+)
+from models import AdaptPointFormer
 from torch.utils.data import DataLoader
-from models import AdaptPointFormer, AdaptPointFormerWithSampling
 from train.train_utils import save_configs
-
+from timm.scheduler import CosineLRScheduler
 
 class APFTrainer:
     """Trainer class for AdaptPointFormer model on ScanObjectNN dataset"""
@@ -43,15 +45,15 @@ class APFTrainer:
         # Set device
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
-        
+
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
+        # Save configurations to a file
+        save_configs(model_config, dataset_config, train_config, output_dir, self.device)
+
         # Path for metrics CSV file
         self.metrics_csv_path = os.path.join(output_dir, "training_metrics.csv")
-        
-        # Save all configurations to a file
-        save_configs(model_config, dataset_config, train_config, output_dir, self.device)
         
         # Initialize the model, datasets, and loaders
         self._init_model()
@@ -59,76 +61,83 @@ class APFTrainer:
         self._init_loaders()
         self._init_optimizer()
         self._init_metrics_csv()
-        
+
     def _init_model(self) -> None:
-        """Initialize the AdaptPointFormer model.
-        
-        Creates the appropriate model based on model_config and moves it to the 
-        specified device.
-        
-        TODO: The first option should not be used, maybe revisit later, and remove it.
-        """
-        if self.model_config['model_name'] == 'AdaptPointFormer':
-            self.model = AdaptPointFormer(
-                num_classes=self.model_config['num_classes'],
-                num_points=self.model_config['num_points'],
-                vit_name=self.model_config['vit_name'],
-                adapter_dim=self.model_config['adapter_dim'],
-                pretrained=self.model_config['pretrained'],
-                dropout_rate=self.model_config['dropout_rate']
-            )
-        else:
-            self.model = AdaptPointFormerWithSampling(
-                num_classes=self.model_config['num_classes'],
-                num_points=self.model_config['num_points'],
-                vit_name=self.model_config['vit_name'],
-                adapter_dim=self.model_config['adapter_dim'],
-                pretrained=self.model_config['pretrained'],
-                dropout_rate=self.model_config['dropout_rate'],
-                fps_sampling_func=self.model_config['fps_sampling_func'],
-                n_samples=self.model_config['n_samples'],
-                k_neighbors=self.model_config['k_neighbors']
-            )
-        
+        """Initialize the AdaptPointFormer model."""
+        self.model = AdaptPointFormer(
+            # General architecture
+            num_classes = self.model_config['num_classes'],
+            in_channels = self.model_config['in_channels'],
+            vit_name = self.model_config['vit_name'],
+            pretrained = self.model_config.get('pretrained', True),
+            embedding_dim= self.model_config.get('embedding_dim', 768),
+            # Data sampling
+            npoint = self.model_config.get('npoint', 196),
+            nsample = self.model_config.get('nsample', 32),
+            # Optimization
+            dropout_rate = self.model_config.get('dropout_rate', 0.1),
+            dropout_path_rate = self.model_config.get('drop_path_rate', 0.1),
+        )
+
         self.model.to(self.device)
-        self.model.print_trainable_params()
-        
+
     def _init_datasets(self) -> None:
         """Initialize training and testing datasets.
         
         Creates ScanObjectNN dataset instances for both training and testing
         based on the dataset_config.
         """
+
+
+        train_transforms = [
+            scale_point_cloud,
+            center_and_normalize_point_cloud,
+            rotate_point_cloud,
+        ]
+        test_transforms = [
+            center_and_normalize_point_cloud,
+        ]
+
         print("Loading training dataset...")
         self.train_dataset = ScanObjectNN(
             root_dir=self.dataset_config['root_dir'],
+            # Split related
             split='training',
             variant=self.dataset_config['variant'],
             augmentation=self.dataset_config['augmentation'],
-            num_points=self.dataset_config['num_points'],
-            normalize=self.dataset_config['normalize'],
-            sampling_method=self.dataset_config.get('sampling_method', 'all'),
-            use_custom_augmentation=self.dataset_config.get('use_custom_augmentation', False)
+            background=self.dataset_config.get('background', False),
+            use_newsplit=self.dataset_config.get('use_newsplit', False),
+            # Data related
+            num_points=self.dataset_config['train_num_points'],
+            normalize=self.dataset_config.get('normalize', False),
+            sampling_method=self.dataset_config.get('sampling_method', 'fps'),
+            use_height= self.dataset_config.get('use_height', False),
+            # Augmentation
+            use_custom_augmentation=self.dataset_config.get('use_custom_augmentation', False),
+            augmentation_probability=self.dataset_config.get('augmentation_probability', 0.0),
+            transform=train_transforms
         )
         
         print("Loading test dataset...")
         self.test_dataset = ScanObjectNN(
             root_dir=self.dataset_config['root_dir'],
+            # Split related
             split='test',
             variant=self.dataset_config['variant'],
             augmentation=self.dataset_config['augmentation'],
-            num_points=self.dataset_config['num_points'],
-            normalize=self.dataset_config['normalize'],
-            sampling_method=self.dataset_config.get('sampling_method', 'all'),
-            use_custom_augmentation=False
+            background=self.dataset_config.get('background', False),
+            use_newsplit=self.dataset_config.get('use_newsplit', False),
+            # Data related
+            num_points=self.dataset_config['test_num_points'],
+            normalize=self.dataset_config.get('normalize', False),
+            sampling_method=self.dataset_config.get('sampling_method', 'fps'),
+            use_height= self.dataset_config.get('use_height', False),
+            # Augmentation
+            use_custom_augmentation=self.dataset_config.get('use_custom_augmentation', False),
+            augmentation_probability=self.dataset_config.get('augmentation_probability', 0.0),
+            transform=test_transforms
         )
-        
-        # As model config and dataset config are initialized separately,
-        # this makes sure we not forget to update one of them.
-        # Unfortunately, it happend to me multiple times, so I added this check xD.
-        assert self.train_dataset.num_classes == self.model_config['num_classes'], \
-            "Number of classes in model config must match dataset classes"
-        
+
         print(f"Dataset loaded: {len(self.train_dataset)} train samples, {len(self.test_dataset)} test samples")
         print(f"Number of classes: {self.train_dataset.num_classes}")
         
@@ -154,44 +163,28 @@ class APFTrainer:
         
     def _init_optimizer(self) -> None:
         """Initialize optimizer, learning rate scheduler, and criterion."""
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=self.train_config.get('label_smoothing', 0.3)
+        )
         self.optimizer = optim.AdamW(
-            self.model.get_trainable_params(),
+            self.model.parameters(),
+            betas=(0.9, 0.999),
+            eps=1e-8,
             lr=self.train_config['learning_rate'],
             weight_decay=self.train_config['weight_decay']
         )
-        
-        # Initialize learning rate scheduler if enabled
-        self.scheduler = None
-        if self.train_config.get('use_lr_scheduler', False):
-            total_epochs = self.train_config['epochs']
-            warmup_epochs = self.train_config.get('warmup_epochs', 0)
-            warmup_factor = self.train_config.get('warmup_factor', 0.1)
-            min_factor = self.train_config.get('min_factor', 1e-6)
-            
-            # Create warmup + cosine annealing scheduler
-            if warmup_epochs > 0:
-                # Define warmup function
-                def lr_lambda(epoch):
-                    if epoch < warmup_epochs:
-                        # Linear warmup
-                        return warmup_factor + (1.0 - warmup_factor) * epoch / warmup_epochs
-                    else:
-                        # Cosine annealing
-                        return min_factor + 0.5 * (1.0 + np.cos(np.pi * (epoch - warmup_epochs) / (total_epochs - warmup_epochs)))
-                
-                self.scheduler = LambdaLR(self.optimizer, lr_lambda)
-            else:
-                # cosine annealing without warmup
-                self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_epochs, eta_min=min_factor)
+    
+        self.scheduler = CosineLRScheduler(
+            self.optimizer,
+            t_initial=self.train_config['epochs'],
+            warmup_t=self.train_config.get('warmup_epochs', 10),
+            warmup_lr_init=self.train_config.get('warmup_lr_init', 1e-3),
+            cycle_decay=0.05
+        )
         
     def _init_metrics_csv(self) -> None:
         """Initialize the CSV file for tracking metrics."""
-        headers = ['epoch', 'train_loss', 'train_accuracy', 'test_loss', 'test_accuracy']
-        
-        # Add learning rate to headers if scheduler is used
-        if self.train_config.get('use_lr_scheduler', False):
-            headers.append('learning_rate')
+        headers = ['epoch', 'train_loss', 'train_accuracy', 'test_loss', 'test_accuracy', 'learning_rate']
         
         with open(self.metrics_csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -201,12 +194,9 @@ class APFTrainer:
                            train_acc: float, test_loss: float, test_acc: float) -> None:
         """Append metrics for the current epoch to the CSV file."""
         row = [epoch + 1, train_loss, train_acc, test_loss, test_acc]
-        
-        # Add current learning rate to metrics if scheduler is used
-        if self.train_config.get('use_lr_scheduler', False):
-            current_lr = self.optimizer.param_groups[0]['lr']
-            row.append(current_lr)
-        
+        row.append(
+            self.optimizer.param_groups[0]['lr']
+        )
         with open(self.metrics_csv_path, 'a', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(row)
@@ -244,7 +234,7 @@ class APFTrainer:
             
             # Step the learning rate scheduler
             if self.scheduler:
-                self.scheduler.step()
+                self.scheduler.step(epoch)
                 
             # Print epoch results
             print(f"Epoch {epoch+1} results:")
@@ -261,53 +251,31 @@ class APFTrainer:
         correct = 0
         total = 0
         
-        # Get gradient accumulation settings
-        use_grad_accumulation = self.train_config.get('use_grad_accumulation', False)
-        grad_accumulation_steps = self.train_config.get('grad_accumulation_steps', 1)
-        
         pbar = tqdm(self.train_loader, desc="Training")
         for i, (points, labels) in enumerate(pbar):
             points = points.to(self.device)
             labels = labels.to(self.device)
-            
-            # Zero the gradients only at the beginning of accumulation cycle
-            if not use_grad_accumulation or (i % grad_accumulation_steps == 0):
-                self.optimizer.zero_grad()
+
+            self.optimizer.zero_grad()
             
             # Forward pass
             logits = self.model(points)
             loss = self.criterion(logits, labels)
             
-            # Scale loss for gradient accumulation to maintain correct gradient magnitude
-            if use_grad_accumulation:
-                loss = loss / grad_accumulation_steps
-            
             # Backward pass
             loss.backward()
+
+            self.optimizer.step()
             
-            # Optimize only after accumulating enough gradients or at the end of the epoch
-            if not use_grad_accumulation or ((i + 1) % grad_accumulation_steps == 0) or (i == len(self.train_loader) - 1):
-                # Apply gradient clipping if enabled - moved here to clip after accumulation
-                if self.train_config.get('use_grad_clip', False):
-                    max_norm = self.train_config.get('grad_clip_norm', 1.0)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-                
-                self.optimizer.step()
-            
-            # For reporting, use the unscaled loss
-            if use_grad_accumulation:
-                unscaled_loss = loss.item() * grad_accumulation_steps
-                total_loss += unscaled_loss
-            else:
-                total_loss += loss.item()
+            total_loss += loss.item()
             
             # Statistics
             _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
-            # Update progress bar with unscaled loss for clarity
-            display_loss = loss.item() * grad_accumulation_steps if use_grad_accumulation else loss.item()
+            # Update progress bar
+            display_loss = loss.item()
             pbar.set_postfix({
                 'loss': f"{display_loss:.4f}",
                 'acc': f"{100.0 * correct / total:.2f}%"
@@ -376,26 +344,3 @@ class APFTrainer:
         }
         
         torch.save(checkpoint, os.path.join(self.output_dir, filename))
-        
-    def load_checkpoint(self, checkpoint_path: str) -> None:
-        """Load model from checkpoint.
-        
-        Args:
-            checkpoint_path: Path to the checkpoint file.
-            
-        TODO: After implementing this, I never used it again, so revisit later and remove it if not needed.
-        """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Update configs if needed
-        self.model_config = checkpoint.get('model_config', self.model_config)
-        self.dataset_config = checkpoint.get('dataset_config', self.dataset_config)
-        
-        # Reinitialize model with loaded config
-        self._init_model()
-        
-        # Load state dictionaries
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        print(f"Loaded checkpoint from epoch {checkpoint['epoch']} with accuracy {checkpoint['accuracy']:.4f}")

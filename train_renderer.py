@@ -1,7 +1,7 @@
 from train import RendererTrainer
 
 dataset_config = {
-    'root_dir': '/home/basti/Development/University/3DVision/adapting-2D-ViTs-for-3D-point-cloud-understanding/.data/h5_files',
+    'root_dir': '.data/h5_files',
     'split': 'training',
     'variant': 'main_split',
     'augmentation': 'base',
@@ -18,26 +18,20 @@ train_config = {
     'weight_decay': 5e-2,
     'save_interval': 5,
     'epochs': 100,
-    'use_lr_scheduler': True,
-    'clip_grad_norm': 10.0,
-    'save_views_interval': 1,
-    # New parameters for view transformation network
-    'view_learning_rate': 1e-3,     
-    'view_min_lr': 1e-7,            
-    'view_weight_decay': 1e-4,      
-    'view_warmup_epochs': 10,       
+    'use_lr_scheduler': False,
+    'clip_grad_norm': 0.0,
 }
 
 model_config = {
     'num_classes': 15,
     'vit_name': 'vit_b_16',
-    'adapter_dim': 32,
-    'num_views': 3,
+    'adapter_dim': 64,
+    'num_views': 6,
     'img_size': 224,
     'pretrained': True, 
-    'dropout_rate': 0.2,
+    'dropout_rate': 0.1,
     'diff_renderer': True,
-    'view_transform_hidden': 64,
+    'view_transform_hidden': 256,
 }
 
 trainer = RendererTrainer(
@@ -45,7 +39,7 @@ trainer = RendererTrainer(
     dataset_config=dataset_config,
     train_config=train_config,
     device='cuda',
-    output_dir='./experiment/renderer/run_6' 
+    output_dir='./output/renderer' 
 )
 
 trainer.train()

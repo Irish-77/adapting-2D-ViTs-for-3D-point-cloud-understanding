@@ -1,44 +1,53 @@
-
 from train import APFTrainer
-from data import fps_sampling_with_knn_optimized
 
 model_config = {
-    'model_name': 'AdaptPointFormerWithSampling',
     'num_classes': 15,
-    'num_points': 2048,
-    'vit_name': 'vit_b_16',
-    'adapter_dim': 64,
+    'in_channels': 4, 
+    'vit_name': 'vit_base_patch16_224',
     'pretrained': True,
+    'embedding_dim': 768,
+    'npoint': 196,
+    'nsample': 32,
     'dropout_rate': 0.1,
-    'fps_sampling_func': fps_sampling_with_knn_optimized,
-    'n_samples': 512,
-    'k_neighbors': 16,
+    'dropout_path_rate': 0.1,
 }
 
+
 dataset_config = {
-    'root_dir': '/home/basti/Development/University/3DVision/adapting-2D-ViTs-for-3D-point-cloud-understanding/.data/h5_files',
-    'split': 'training',
+    # REPLACE WITH CUSTOM DATASET PATH
+    'root_dir': '.data/h5_files',
     'variant': 'main_split',
     'augmentation': 'base',
-    'num_points': 2048,
-    'normalize': True,
-    'sampling_method': 'all',
-    'use_custom_augmentation': True,
+    'background': False,
+    'use_newsplit': False,
+    'train_num_points': 2048,
+    'test_num_points': 1024,
+    'sampling_method': 'fps',
+    'use_apf_augmentation': True,
+    'use_custom_augmentation': False,
+    'augmentation_probability': 0.0,
+    'use_height': True,
 }
 
 train_config = {
-    'batch_size': 16,
+    'batch_size': 32,
+    'save_interval': 100,
+    'epochs': 100,
+    # Optimizer
+    'label_smoothing': 0.3,
     'learning_rate': 5e-4,
     'weight_decay': 5e-2,
-    'save_interval': 5,
-    'epochs': 100,
+    'warmup_epochs': 10,
+    'warmup_lr_init': 1e-3,
 }
+
 
 trainer = APFTrainer(
     model_config=model_config,
     dataset_config=dataset_config,
     train_config=train_config,
-    device='cuda'
+    device='cuda',
+    output_dir='./output/apf', 
 )
 
 trainer.train()

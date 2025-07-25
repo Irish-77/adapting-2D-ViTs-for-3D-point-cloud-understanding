@@ -1,11 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models import get_vit
-from torchvision import models
-from models.apf import AdaptedViTBlock
 from typing import Tuple
-
 
 class ViewTransformationNetwork(nn.Module):
     """
@@ -104,10 +99,9 @@ class DifferentiablePointCloudRenderer(nn.Module):
     Differentiable renderer that projects 3D point clouds to 2D images.
     
     Based on the MVTN paper's approach, this renderer uses 2D bilinear interpolation
-    to scatter points onto an image grid, which is more efficient than Gaussian splatting
-    while still being differentiable.
+    to scatter points onto an image grid.
         
-    References:
+    References and inspired by:
         - https://arxiv.org/pdf/2011.13244
         - https://github.com/ajhamdi/MVTN
     """
@@ -191,7 +185,7 @@ class DifferentiablePointCloudRenderer(nn.Module):
         # Filter points that project outside the image boundaries
         mask = (px1 >= 0) & (py1 >= 0) & (px2 < W) & (py2 < H)
 
-        # Prepare tensors for the scatter operation
+        # Prepare tensors for scatter operation
         weights = torch.stack([w11, w12, w21, w22], dim=2)[mask] # (n_valid_points, 4)
         
         # Expand features for each of 4 neighbors
@@ -239,7 +233,7 @@ class DifferentiablePointCloudRenderer(nn.Module):
         # Rotate points
         rotated_points = self.apply_rotation(points, azimuth, elevation)
 
-        # Orthographically project points and get depth
+        # Project points and get depth
         points_2d = rotated_points[..., :2] # Use x, y for projection
         z_coords = rotated_points[..., 2]   # Use z for depth feature
 
@@ -254,7 +248,8 @@ class DifferentiablePointCloudRenderer(nn.Module):
 
 
 
-# # Uncomment the following code if you want to use Gaussian splatting instead of bilinear interpolation. But it requires aaaaaaaaa lot of memory :(.
+# # Uncomment the following code if you want to use Gaussian splatting instead of bilinear interpolation
+# # and if you have lots of time and aaaaaaaaa lot of memory ;(.
 # class DifferentiablePointCloudRenderer(nn.Module):
 #     """Fully differentiable point cloud renderer using Gaussian splatting"""
     

@@ -31,21 +31,68 @@ def furthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
 
 
 def fps(data: torch.Tensor, number: int) -> torch.Tensor:
-    """
-    Performs furthest point sampling and gathers the sampled points.
-    
+    """Farthest point sampling on a point cloud tensor.
+
     Args:
-        data: Input point cloud tensor of shape (B, N, C) where B is batch size,
-             N is number of points, and C is the dimension of each point
-        number: Number of points to sample
-    
+        data: Input point cloud tensor of shape (B, N, C).
+        number: Number of points to sample.
     Returns:
-        torch.Tensor: Sampled points with shape (B, number, C)
+        torch.Tensor: Sampled point cloud tensor of shape (B, number, C).
     """
     fps_idx = furthest_point_sample(data[:, :, :3].contiguous(), number)
     fps_data = torch.gather(
         data, 1, fps_idx.unsqueeze(-1).long().expand(-1, -1, data.shape[-1]))
     return fps_data
+
+def _square_distance(src, dst):
+    """Compute squared distance between two sets of points.
+    
+    Args:
+        src: Source points tensor of shape (B, N, C)
+        dst: Destination points tensor of shape (B, M, C)
+
+    Returns:
+        torch.Tensor: Squared distance tensor of shape (B, N, M)
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
+
+def knn_point(nsample, xyz, new_xyz):
+    """
+    Input:
+        nsample: max sample number in local region
+        xyz: all points, [B, N, C]
+        new_xyz: query points, [B, S, C]
+    Return:
+        group_idx: grouped points index, [B, S, nsample]
+    """
+    sqrdists = _square_distance(new_xyz, xyz)
+    _, group_idx = torch.topk(sqrdists, nsample, dim=-1, largest=False, sorted=False)
+    return group_idx
+
+def index_points(points, idx):
+    """ 
+    Input:
+        points: input points data, [B, N, C]
+        idx: sample index data, [B, S]
+    Return:
+        new_points:, indexed points data, [B, S, C]
+    """
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+
+    return new_points
+
 
 
 def _farthest_point_sampling(points: torch.Tensor, n_samples: int) -> torch.Tensor:
